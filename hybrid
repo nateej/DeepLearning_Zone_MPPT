@@ -285,6 +285,15 @@ def clean_iv_curve_strict(v: np.ndarray, i: np.ndarray) -> Tuple[np.ndarray, np.
 
     mask = np.isfinite(v) & np.isfinite(i)
     v, i = v[mask], i[mask]
+    # Identify the physical Voc boundary where current drops to 0.
+    zero_crossings = np.where(i <= 0)[0]
+    if len(zero_crossings) > 0:
+        first_zero = int(zero_crossings[0])
+        # Truncate the arrays so the curve physically stops at Voc.
+        v = v[:first_zero + 1]
+        i = i[:first_zero + 1]
+
+    # Safety clip to ensure no negative micro-fluctuations exist prior to Voc.
     v = np.clip(v, a_min=0.0, a_max=None)
     i = np.clip(i, a_min=0.0, a_max=None)
     if len(v) < 3:
@@ -366,16 +375,6 @@ def prepare_pv_plot_curve(v: np.ndarray, i: np.ndarray) -> Tuple[np.ndarray, np.
     v, i = v[keep], i[keep]
     if len(v) < 2:
         return np.array([]), np.array([])
-    # Estimate Voc from first sign change if available; otherwise use max measured V.
-    voc_est = float(v[-1])
-    sign_changes = np.where(np.diff(np.signbit(i)))[0]
-    if len(sign_changes) > 0:
-        k = int(sign_changes[0])
-        v1, v2 = float(v[k]), float(v[k + 1])
-        i1, i2 = float(i[k]), float(i[k + 1])
-        if abs(i2 - i1) > 1e-12:
-            voc_est = float(v1 - i1 * (v2 - v1) / (i2 - i1))
-    voc_est = max(voc_est, 0.0)
     # For plotting only: power cannot be negative.
     p = np.clip(v * i, 0.0, None)
     p0 = 0.0
@@ -387,11 +386,7 @@ def prepare_pv_plot_curve(v: np.ndarray, i: np.ndarray) -> Tuple[np.ndarray, np.
     else:
         pp[0] = 0.0
         pv[0] = 0.0
-    if voc_est > pv[-1] + 1e-9:
-        pv = np.concatenate((pv, [voc_est]))
-        pp = np.concatenate((pp, [0.0]))
-    else:
-        pp[-1] = 0.0
+    pp[-1] = 0.0
     return pv.astype(np.float32), pp.astype(np.float32)
 
 
