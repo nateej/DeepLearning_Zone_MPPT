@@ -1171,15 +1171,15 @@ def visualize_examples_from_full_shaded_pool(examples: List[Dict[str, Any]], n_v
         ax.plot(v_plot, p_plot, label='Plot-ready P-V curve')
         ax.scatter(item['V_samples'], item['P_samples'], s=20, alpha=0.65, label='12 sample points')
         ax.scatter([oracle.vmpp_true], [oracle.pmpp_true], marker='*', s=160, label='True MPP', zorder=5)
-        ax.scatter([item['V_ann']], [item['P_ann']], marker='x', s=90, label='ANN stage', zorder=6)
-        ax.scatter([item['V_final']], [item['P_final']], marker='D', s=70, label='ANN + local P&O', zorder=6)
+        ax.scatter([item['V_ann']], [item['P_ann']], marker='x', s=90, label='TCNformer stage', zorder=6)
+        ax.scatter([item['V_final']], [item['P_final']], marker='D', s=70, label='TCNformer + local P&O', zorder=6)
         if item.get('po_trace'):
             po_v = [vp[0] for vp in item['po_trace']]
             po_p = [vp[1] for vp in item['po_trace']]
             ax.plot(po_v, po_p, linestyle='--', alpha=0.6, label='Local P&O trace')
         ax.set_title(
             f"Curve {item['curve_idx']} | peaks={item.get('plot_peak_count', 0)} | "
-            f"ANN={item['ann_ratio_pct']:.2f}% | Final={item['final_ratio_pct']:.2f}%"
+            f"TCNformer={item['ann_ratio_pct']:.2f}% | Final={item['final_ratio_pct']:.2f}%"
         )
         ax.set_xlabel('Voltage (V)')
         ax.set_ylabel('Power (W)')
@@ -1232,7 +1232,7 @@ print("\n=== SIM HOLDOUT ANN-ONLY SUMMARY ===")
 for k, v in ann_summary_sim_hold.items():
     print(f"{k}: {v}")
 
-print("\n=== EXP SHADED ANN-ONLY SUMMARY ===")
+print("\n=== EXP SHADED TCNformer-ONLY SUMMARY ===")
 for k, v in ann_summary_exp_sh.items():
     print(f"{k}: {v}")
 
@@ -1240,9 +1240,9 @@ print("\n=== EXP SHADED ANN + LOCAL P&O SUMMARY ===")
 for k, v in hybrid_summary_exp_sh.items():
     print(f"{k}: {v}")
 
-print("\nUnseen shaded experimental ANN-only head:")
+print("\nUnseen shaded experimental TCNformer-only head:")
 display(ann_df_exp_sh.head(10))
-print("\nUnseen shaded experimental ANN + local P&O head:")
+print("\nUnseen shaded experimental TCNformer + local P&O head:")
 display(hybrid_df_exp_sh.head(10))
 
 if REPORT_OK_EXPERIMENTAL_AUX and len(exp_ok_rows) > 0:
