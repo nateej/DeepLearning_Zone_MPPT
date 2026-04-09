@@ -1,0 +1,1179 @@
+import os
+import random
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.model_selection import train_test_split
+
+try:
+    from IPython.display import display
+except Exception:
+    def display(x):
+        print(x)
+
+try:
+    from scipy.io import loadmat
+except Exception:
+    loadmat = None
+
+# =========================================================
+# USER CONFIG
+# =========================================================
+DATASET_PATH = None
+MAKE_PLOTS = True
+SAVE_MODEL_BUNDLE = True
+REPORT_OK_EXPERIMENTAL_AUX = True
+
+# Explicit MAT selection for the Zenodo PV dataset
+MAT_SIM_KEYS = ["full_curvesOk_simulated", "full_curvesSh_simulated"]
+MAT_EXP_SH_KEYS = ["full_curvesSh_experimental"]
+MAT_EXP_OK_KEYS = ["full_curvesOk_experimental"]
+
+@dataclass
+class Config:
+    seed: int = 7
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # 12-point scan stays exactly in the pipeline
+    k_samples: int = 12
+    sample_fracs_min: float = 0.05
+    sample_fracs_max: float = 0.95
+
+    # zone + offset ANN with step-size head
+    n_zones: int = 4
+    hidden1: int = 128
+    hidden2: int = 64
+    dropout: float = 0.10
+
+    # training
+    batch_size: int = 128
+    epochs: int = 120
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    early_stop_patience: int = 16
+    lr_plateau_patience: int = 5
+    label_smoothing: float = 0.03
+    sim_holdout_fraction: float = 0.15
+
+    # loss weights
+    zone_loss_weight: float = 1.0
+    offset_loss_weight: float = 0.35
+    power_loss_weight: float = 0.60
+    pinn_mpp_weight: float = 0.50
+    pinn_boundary_weight: float = 0.05
+    step_loss_weight: float = 0.08
+    shockley_weight: float = 0.0  # kept off by default; dataset has no diode params
+
+    # local P&O
+    po_iterations: int = 14
+    po_min_step_ratio: float = 0.003
+    po_max_step_ratio: float = 0.050
+    po_step_growth: float = 1.15
+    po_step_shrink: float = 0.55
+    po_stop_gain_ratio: float = 0.0005
+
+    # evaluation / plots
+    max_eval_curves: int = 2000
+    n_viz: int = 8
+    plot_peak_rel_thresh: float = 0.01
+    plot_peak_min_gap: int = 20
+
+    @property
+    def sample_fracs(self) -> np.ndarray:
+        return np.linspace(self.sample_fracs_min, self.sample_fracs_max, self.k_samples).astype(np.float32)
+
+    @property
+    def zone_edges(self) -> np.ndarray:
+        return np.linspace(self.sample_fracs_min, self.sample_fracs_max, self.n_zones + 1).astype(np.float32)
+
+cfg = Config()
+
+# =========================================================
+# REPRODUCIBILITY
+# =========================================================
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    try:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except Exception:
+        pass
+
+set_seed(cfg.seed)
+print("Device:", cfg.device)
+
+# =========================================================
+# COLAB FILE UPLOAD
+# =========================================================
+if DATASET_PATH is None:
+    try:
+        from google.colab import files  # type: ignore
+        uploaded = files.upload()
+        if len(uploaded) == 0:
+            raise RuntimeError("No file uploaded.")
+        DATASET_PATH = next(iter(uploaded.keys()))
+    except Exception as e:
+        raise RuntimeError(
+            "Set DATASET_PATH manually or run this in Colab and upload your .npz/.mat dataset."
+        ) from e
+
+if not os.path.exists(DATASET_PATH):
+    raise FileNotFoundError(f"Dataset not found: {DATASET_PATH}")
+
+print("Dataset path:", DATASET_PATH)
+
+# =========================================================
+# DATA LOADING
+# =========================================================
+def iter_curve_items(curves: Any):
+    if isinstance(curves, list):
+        for item in curves:
+            yield item
+        return
+    if isinstance(curves, tuple):
+        for item in curves:
+            yield item
+        return
+
+    arr = np.asarray(curves, dtype=object)
+    if arr.ndim == 0:
+        yield arr.item()
+        return
+
+    if arr.ndim >= 3 and (arr.shape[-2] == 2 or arr.shape[-1] == 2):
+        for k in range(arr.shape[0]):
+            yield np.asarray(arr[k], dtype=float)
+        return
+
+    if arr.ndim == 2 and (arr.shape[0] == 2 or arr.shape[1] == 2):
+        yield np.asarray(arr, dtype=float)
+        return
+
+    for item in arr.ravel():
+        yield item
+
+
+def _maybe_struct_get(obj: Any, names: Sequence[str]) -> Any:
+    for name in names:
+        if isinstance(obj, dict) and name in obj:
+            return obj[name]
+        if hasattr(obj, name):
+            return getattr(obj, name)
+    return None
+
+
+def extract_vi(curve: Any) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    if curve is None:
+        return None, None
+
+    if isinstance(curve, dict):
+        v = _maybe_struct_get(curve, ["v", "V", "voltage", "x"])
+        i = _maybe_struct_get(curve, ["i", "I", "current", "y"])
+        if v is not None and i is not None:
+            return np.asarray(v, dtype=float).ravel(), np.asarray(i, dtype=float).ravel()
+
+    arr = np.asarray(curve, dtype=object)
+    if arr.ndim == 0:
+        try:
+            return extract_vi(arr.item())
+        except Exception:
+            return None, None
+
+    # numeric matrix path
+    try:
+        c = np.asarray(curve)
+        if c.ndim == 2:
+            if c.shape[0] == 2:
+                return np.asarray(c[0], dtype=float).ravel(), np.asarray(c[1], dtype=float).ravel()
+            if c.shape[1] >= 2:
+                return np.asarray(c[:, 0], dtype=float).ravel(), np.asarray(c[:, 1], dtype=float).ravel()
+    except Exception:
+        pass
+
+    # nested object wrapper path
+    flat = arr.reshape(-1)
+    for item in flat:
+        try:
+            v, i = extract_vi(item)
+            if v is not None and i is not None:
+                return v, i
+        except Exception:
+            continue
+    return None, None
+
+
+def _load_npz(path: str) -> Dict[str, Any]:
+    d = np.load(path, allow_pickle=True)
+    return {k: d[k] for k in d.files}
+
+
+def _load_mat(path: str) -> Dict[str, Any]:
+    if loadmat is None:
+        raise RuntimeError("scipy is required to read .mat files")
+    m = loadmat(path)
+    return {k: v for k, v in m.items() if not k.startswith("__")}
+
+
+def _combine_curve_groups(raw: Dict[str, Any], keys: Sequence[str]) -> List[Any]:
+    rows: List[Any] = []
+    for k in keys:
+        if k not in raw:
+            continue
+        rows.extend(list(iter_curve_items(raw[k])))
+    return rows
+
+
+def load_dataset(path: str):
+    if path.lower().endswith(".npz"):
+        raw = _load_npz(path)
+        sim_curves = list(iter_curve_items(raw["sim_curves"])) if "sim_curves" in raw else []
+        exp_sh_curves = list(iter_curve_items(raw["exp_sh_curves"])) if "exp_sh_curves" in raw else []
+        exp_ok_curves = list(iter_curve_items(raw["exp_ok_curves"])) if "exp_ok_curves" in raw else []
+        if len(exp_sh_curves) == 0 and "exp_curves" in raw:
+            exp_sh_curves = list(iter_curve_items(raw["exp_curves"]))
+        return sim_curves, exp_sh_curves, exp_ok_curves
+    if path.lower().endswith(".mat"):
+        raw = _load_mat(path)
+        print("\nMAT key inspection:")
+        for k, v in raw.items():
+            try:
+                a = np.asarray(v, dtype=object)
+                print(f"  - key={k}, type={type(v).__name__}, shape={a.shape}, dtype={a.dtype}")
+            except Exception:
+                print(f"  - key={k}, type={type(v).__name__}")
+        sim_curves = _combine_curve_groups(raw, MAT_SIM_KEYS)
+        exp_sh_curves = _combine_curve_groups(raw, MAT_EXP_SH_KEYS)
+        exp_ok_curves = _combine_curve_groups(raw, MAT_EXP_OK_KEYS)
+        print("\nSelected dataset sources:")
+        print("  - selected simulated source keys:", MAT_SIM_KEYS)
+        print("  - selected experimental shaded source keys:", MAT_EXP_SH_KEYS)
+        print("  - selected experimental ok source keys:", MAT_EXP_OK_KEYS)
+        print("  - number of simulated curves:", len(sim_curves))
+        print("  - number of shaded experimental curves:", len(exp_sh_curves))
+        print("  - number of ok experimental curves:", len(exp_ok_curves))
+        return sim_curves, exp_sh_curves, exp_ok_curves
+    raise ValueError("Dataset must be .npz or .mat")
+
+# =========================================================
+# CLEANING / VALIDATION (STRICT: no synthetic endpoints)
+# =========================================================
+def clean_iv_curve_strict(v: np.ndarray, i: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    if v is None or i is None:
+        return np.array([]), np.array([])
+    v = np.asarray(v, dtype=float).ravel()
+    i = np.asarray(i, dtype=float).ravel()
+    if len(v) != len(i) or len(v) < 3:
+        return np.array([]), np.array([])
+
+    mask = np.isfinite(v) & np.isfinite(i)
+    v, i = v[mask], i[mask]
+    if len(v) < 3:
+        return np.array([]), np.array([])
+
+    idx = np.argsort(v)
+    v, i = v[idx], i[idx]
+
+    v, unique_idx = np.unique(v, return_index=True)
+    i = i[unique_idx]
+    if len(v) < 3:
+        return np.array([]), np.array([])
+
+    if np.nanmean(i) < 0:
+        i = -i
+
+    keep = v >= 0.0
+    v, i = v[keep], i[keep]
+    if len(v) < 3:
+        return np.array([]), np.array([])
+
+    return v.astype(np.float32), i.astype(np.float32)
+
+
+def validate_cleaned_curve(v: np.ndarray, i: np.ndarray) -> bool:
+    if len(v) < 8 or len(i) < 8:
+        return False
+    if len(v) != len(i):
+        return False
+    if not np.all(np.isfinite(v)) or not np.all(np.isfinite(i)):
+        return False
+    if not np.all(np.diff(v) > 0):
+        return False
+    if float(np.max(v)) <= 0:
+        return False
+    if float(np.max(v * i)) <= 0:
+        return False
+    return True
+
+
+def compute_mpp_dense(v: np.ndarray, i: np.ndarray, n: int = 2000) -> Tuple[float, float, np.ndarray, np.ndarray]:
+    if len(v) < 3:
+        return 0.0, 0.0, np.array([]), np.array([])
+    v0 = float(np.min(v))
+    v1 = float(np.max(v))
+    if v1 <= v0:
+        return 0.0, 0.0, np.array([]), np.array([])
+    v_dense = np.linspace(v0, v1, n)
+    i_dense = np.interp(v_dense, v, i)
+    p_dense = v_dense * i_dense
+    k = int(np.argmax(p_dense))
+    return float(v_dense[k]), float(p_dense[k]), v_dense, p_dense
+
+
+def prepare_pv_plot_curve(v: np.ndarray, i: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Prepare a visualization-only P-V curve.
+    This does NOT affect ANN training/evaluation. It only makes the plotted P-V trace
+    start at (0,0), stay nonnegative, and end at (Voc,0).
+    """
+    if v is None or i is None:
+        return np.array([]), np.array([])
+    v = np.asarray(v, dtype=float).ravel()
+    i = np.asarray(i, dtype=float).ravel()
+    if len(v) != len(i) or len(v) < 2:
+        return np.array([]), np.array([])
+    mask = np.isfinite(v) & np.isfinite(i)
+    v, i = v[mask], i[mask]
+    if len(v) < 2:
+        return np.array([]), np.array([])
+    idx = np.argsort(v)
+    v, i = v[idx], i[idx]
+    v, unique_idx = np.unique(v, return_index=True)
+    i = i[unique_idx]
+    if len(v) < 2:
+        return np.array([]), np.array([])
+    if np.nanmean(i) < 0:
+        i = -i
+    keep = v >= 0.0
+    v, i = v[keep], i[keep]
+    if len(v) < 2:
+        return np.array([]), np.array([])
+    # Estimate Voc from first sign change if available; otherwise use max measured V.
+    voc_est = float(v[-1])
+    sign_changes = np.where(np.diff(np.signbit(i)))[0]
+    if len(sign_changes) > 0:
+        k = int(sign_changes[0])
+        v1, v2 = float(v[k]), float(v[k + 1])
+        i1, i2 = float(i[k]), float(i[k + 1])
+        if abs(i2 - i1) > 1e-12:
+            voc_est = float(v1 - i1 * (v2 - v1) / (i2 - i1))
+    voc_est = max(voc_est, 0.0)
+    # For plotting only: power cannot be negative.
+    p = np.clip(v * i, 0.0, None)
+    p0 = 0.0
+    pv = v.copy()
+    pp = p.copy()
+    if pv[0] > 1e-9:
+        pv = np.concatenate(([0.0], pv))
+        pp = np.concatenate(([p0], pp))
+    else:
+        pp[0] = 0.0
+        pv[0] = 0.0
+    if voc_est > pv[-1] + 1e-9:
+        pv = np.concatenate((pv, [voc_est]))
+        pp = np.concatenate((pp, [0.0]))
+    else:
+        pp[-1] = 0.0
+    return pv.astype(np.float32), pp.astype(np.float32)
+
+
+def dense_peak_profile_for_plot(oracle, n_dense: int = 2000, rel_thresh: float = 0.01, min_index_gap: int = 20) -> Dict[str, Any]:
+    v, i = oracle.curve_for_plot()
+    pv_v, pv_p = prepare_pv_plot_curve(v, i)
+    if len(pv_v) < 3:
+        return {
+            "n_peaks": 0,
+            "peak_idxs": [],
+            "peak_prominence_score": 0.0,
+            "v_dense": np.array([]),
+            "p_dense": np.array([]),
+        }
+    v_dense = np.linspace(float(np.min(pv_v)), float(np.max(pv_v)), n_dense)
+    p_dense = np.interp(v_dense, pv_v, pv_p)
+    n_peaks, peak_idxs = count_local_maxima_dense(p_dense, rel_thresh=rel_thresh, min_index_gap=min_index_gap)
+    if n_peaks < 2:
+        prom_score = 0.0
+    else:
+        peak_vals = sorted([float(p_dense[k]) for k in peak_idxs], reverse=True)
+        prom_score = float(peak_vals[1] / max(peak_vals[0], 1e-12))
+    return {
+        "n_peaks": int(n_peaks),
+        "peak_idxs": list(peak_idxs),
+        "peak_prominence_score": float(prom_score),
+        "v_dense": v_dense.astype(np.float32),
+        "p_dense": p_dense.astype(np.float32),
+    }
+
+def count_local_maxima_dense(p_arr: np.ndarray, rel_thresh: float = 0.01, min_index_gap: int = 20) -> Tuple[int, List[int]]:
+    p = np.asarray(p_arr, dtype=float).ravel()
+    if len(p) < 5:
+        return 0, []
+    vmax = max(float(np.max(p)), 1e-12)
+    thresh = rel_thresh * vmax
+    peaks: List[int] = []
+    for k in range(1, len(p) - 1):
+        if p[k] >= p[k - 1] and p[k] >= p[k + 1] and p[k] >= thresh:
+            peaks.append(k)
+    if len(peaks) <= 1:
+        return len(peaks), peaks
+    merged = [peaks[0]]
+    for idx in peaks[1:]:
+        if idx - merged[-1] < min_index_gap:
+            if p[idx] > p[merged[-1]]:
+                merged[-1] = idx
+        else:
+            merged.append(idx)
+    return len(merged), merged
+
+
+def dense_peak_profile(v: np.ndarray, i: np.ndarray, cfg: Config) -> Dict[str, Any]:
+    vmpp, pmpp, v_dense, p_dense = compute_mpp_dense(v, i)
+    if len(v_dense) == 0:
+        return {"vmpp": 0.0, "pmpp": 0.0, "n_peaks": 0, "peak_idxs": [], "peak_prominence_score": 0.0,
+                "v_dense": np.array([]), "p_dense": np.array([])}
+    n_peaks, peak_idxs = count_local_maxima_dense(
+        p_dense, rel_thresh=cfg.plot_peak_rel_thresh, min_index_gap=cfg.plot_peak_min_gap
+    )
+    if n_peaks < 2:
+        prom_score = 0.0
+    else:
+        peak_vals = sorted([float(p_dense[k]) for k in peak_idxs], reverse=True)
+        prom_score = float(peak_vals[1] / max(peak_vals[0], 1e-12))
+    return {
+        "vmpp": vmpp,
+        "pmpp": pmpp,
+        "n_peaks": int(n_peaks),
+        "peak_idxs": list(peak_idxs),
+        "peak_prominence_score": prom_score,
+        "v_dense": v_dense,
+        "p_dense": p_dense,
+    }
+
+# =========================================================
+# CURVE ORACLE + FEATURES
+# =========================================================
+class CurveOracle:
+    def __init__(self, curve: Any):
+        v_raw, i_raw = extract_vi(curve)
+        self._v, self._i = clean_iv_curve_strict(v_raw, i_raw)
+        if not validate_cleaned_curve(self._v, self._i):
+            self._v = np.array([], dtype=np.float32)
+            self._i = np.array([], dtype=np.float32)
+            self.voc = 0.0
+            self.isc = 0.0
+            self.vmpp_true = 0.0
+            self.pmpp_true = 0.0
+            self.v_dense = np.array([])
+            self.p_dense = np.array([])
+            self.dense_peak_count = 0
+            self.peak_prominence_score = 0.0
+        else:
+            self.voc = float(np.max(self._v))
+            self.isc = float(np.interp(float(np.min(self._v)), self._v, self._i)) if len(self._v) else 0.0
+            prof = dense_peak_profile(self._v, self._i, cfg)
+            self.vmpp_true = float(prof["vmpp"])
+            self.pmpp_true = float(prof["pmpp"])
+            self.v_dense = prof["v_dense"]
+            self.p_dense = prof["p_dense"]
+            self.dense_peak_count = int(prof["n_peaks"])
+            self.peak_prominence_score = float(prof["peak_prominence_score"])
+
+    def measure(self, vq: float) -> float:
+        if self.voc <= 0 or len(self._v) < 2:
+            return 0.0
+        vq = float(np.clip(vq, float(np.min(self._v)), self.voc))
+        return float(np.interp(vq, self._v, self._i))
+
+    def power_at(self, vq: float) -> float:
+        return float(vq * self.measure(vq))
+
+    def curve_for_plot(self) -> Tuple[np.ndarray, np.ndarray]:
+        return self._v.copy(), self._i.copy()
+
+
+def zone_index_and_offset(vhat_true: float, zone_edges: np.ndarray) -> Tuple[int, float]:
+    z = int(np.searchsorted(zone_edges[1:-1], vhat_true, side='right'))
+    z = int(np.clip(z, 0, len(zone_edges) - 2))
+    lo = float(zone_edges[z])
+    hi = float(zone_edges[z + 1])
+    center = 0.5 * (lo + hi)
+    halfw = max(0.5 * (hi - lo), 1e-6)
+    offset = float(np.clip((vhat_true - center) / halfw, -1.0, 1.0))
+    return z, offset
+
+
+def build_feature_vector(v: np.ndarray, i: np.ndarray, sample_fracs: np.ndarray, cfg: Config) -> Dict[str, Any]:
+    voc = float(np.max(v))
+    vmpp_true, pmpp_true, _, _ = compute_mpp_dense(v, i)
+    true_vhat = float(np.clip(vmpp_true / max(voc, 1e-9), cfg.sample_fracs_min, cfg.sample_fracs_max))
+
+    vq = sample_fracs * voc
+    iq = np.interp(vq, v, i)
+    p = v * i
+    p_dense_max = max(float(np.max(p)), 1e-9)
+    isc_ref = max(float(np.max(np.abs(iq))), 1e-9)
+
+    v_norm = (vq / max(voc, 1e-9)).astype(np.float32)
+    i_norm = (iq / isc_ref).astype(np.float32)
+    p_norm = ((vq * iq) / p_dense_max).astype(np.float32)
+    dpdv = np.diff(p_norm) / (np.diff(v_norm) + 1e-12)
+    if len(dpdv) < len(v_norm):
+        dpdv = np.pad(dpdv.astype(np.float32), (0, len(v_norm) - len(dpdv)), mode='edge')
+
+    order_desc = np.argsort(p_norm)[::-1]
+    best_idx = int(order_desc[0])
+    second_idx = int(order_desc[1]) if len(order_desc) > 1 else best_idx
+    top_gap_ratio = float((p_norm[best_idx] - p_norm[second_idx]) / max(abs(float(p_norm[best_idx])), 1e-9))
+
+    dense_prof = dense_peak_profile(v, i, cfg)
+    multi_peak_count = float(dense_prof["n_peaks"])
+    prom_score = float(dense_prof["peak_prominence_score"])
+
+    shape_feats = np.array([
+        np.log1p(voc),
+        np.log1p(max(np.max(np.abs(i)), 1e-9)),
+        np.log1p(max(pmpp_true, 1e-9)),
+        float(v_norm[best_idx]),
+        float(best_idx / max(len(v_norm) - 1, 1)),
+        top_gap_ratio,
+        multi_peak_count,
+        prom_score,
+    ], dtype=np.float32)
+
+    x = np.concatenate([shape_feats, v_norm, i_norm, p_norm, dpdv.astype(np.float32)], axis=0).astype(np.float32)
+    y_zone, y_offset = zone_index_and_offset(true_vhat, cfg.zone_edges)
+
+    # heuristic target for the ANN step-size head: bigger if multi-peak / ambiguous
+    y_step_ratio = float(np.clip(0.010 + 0.008 * min(multi_peak_count, 3.0) + 0.020 * max(0.08 - top_gap_ratio, 0.0),
+                                 cfg.po_min_step_ratio, cfg.po_max_step_ratio))
+
+    return {
+        "x": x,
+        "true_vhat": np.float32(true_vhat),
+        "true_pmpp": np.float32(pmpp_true),
+        "y_zone": np.int64(y_zone),
+        "y_offset": np.float32(y_offset),
+        "y_step_ratio": np.float32(y_step_ratio),
+        "sparse_vhat": v_norm.astype(np.float32),
+        "sparse_phat": p_norm.astype(np.float32),
+        "dense_vhat": np.linspace(cfg.sample_fracs_min, cfg.sample_fracs_max, 256, dtype=np.float32),
+        "dense_pratio": np.interp(
+            np.linspace(cfg.sample_fracs_min, cfg.sample_fracs_max, 256, dtype=np.float32),
+            dense_prof["v_dense"] / max(voc, 1e-9) if len(dense_prof["v_dense"]) else np.array([cfg.sample_fracs_min, cfg.sample_fracs_max], dtype=np.float32),
+            dense_prof["p_dense"] / max(pmpp_true, 1e-9) if len(dense_prof["p_dense"]) else np.array([0.0, 0.0], dtype=np.float32),
+            left=0.0,
+            right=0.0,
+        ).astype(np.float32),
+        "coarse_best_vhat": np.float32(float(v_norm[best_idx])),
+        "coarse_best_phat": np.float32(float(p_norm[best_idx]) * p_dense_max),
+        "multi_peak_count": np.float32(multi_peak_count),
+        "peak_prominence_score": np.float32(prom_score),
+    }
+
+
+def build_dataset_from_curves(curves, cfg: Config):
+    rows: List[Dict[str, Any]] = []
+    stats = {"total": 0, "valid": 0, "skipped_extract": 0, "skipped_clean": 0, "skipped_validate": 0}
+    for item in iter_curve_items(curves):
+        stats["total"] += 1
+        v_raw, i_raw = extract_vi(item)
+        if v_raw is None or i_raw is None:
+            stats["skipped_extract"] += 1
+            continue
+        v, i = clean_iv_curve_strict(v_raw, i_raw)
+        if len(v) < 8:
+            stats["skipped_clean"] += 1
+            continue
+        if not validate_cleaned_curve(v, i):
+            stats["skipped_validate"] += 1
+            continue
+        feat = build_feature_vector(v, i, cfg.sample_fracs, cfg)
+        feat["curve"] = item
+        rows.append(feat)
+        stats["valid"] += 1
+    return rows, stats
+
+# =========================================================
+# MODEL
+# =========================================================
+class PINNZoneOffsetPOANN(nn.Module):
+    def __init__(self, in_dim: int, n_zones: int, cfg: Config):
+        super().__init__()
+        self.backbone = nn.Sequential(
+            nn.Linear(in_dim, cfg.hidden1),
+            nn.BatchNorm1d(cfg.hidden1),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.hidden1, cfg.hidden2),
+            nn.BatchNorm1d(cfg.hidden2),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+        )
+        self.zone_head = nn.Linear(cfg.hidden2, n_zones)
+        self.offset_head = nn.Linear(cfg.hidden2, 1)
+        self.step_head = nn.Linear(cfg.hidden2, 1)
+
+    def forward(self, x: torch.Tensor):
+        h = self.backbone(x)
+        zone_logits = self.zone_head(h)
+        offset = torch.tanh(self.offset_head(h).squeeze(-1))
+        step_ratio_raw = torch.sigmoid(self.step_head(h).squeeze(-1))
+        return zone_logits, offset, step_ratio_raw
+
+
+def compute_pred_vhat(zone_logits: torch.Tensor, offset: torch.Tensor, zone_edges_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    zone_probs = torch.softmax(zone_logits, dim=1)
+    zone_centers = 0.5 * (zone_edges_t[:-1] + zone_edges_t[1:])
+    zone_widths = zone_edges_t[1:] - zone_edges_t[:-1]
+    pred_center = torch.sum(zone_probs * zone_centers.unsqueeze(0), dim=1)
+    pred_width = torch.sum(zone_probs * zone_widths.unsqueeze(0), dim=1)
+    pred_vhat = pred_center + 0.5 * pred_width * offset
+    pred_vhat = torch.clamp(pred_vhat, float(zone_edges_t[0]), float(zone_edges_t[-1]))
+    zone_conf = torch.max(zone_probs, dim=1).values
+    return pred_vhat, zone_probs, pred_center, zone_conf
+
+
+def interp_batch_1d(v_query: torch.Tensor, v_grid: torch.Tensor, y_grid: torch.Tensor) -> torch.Tensor:
+    idx_hi = torch.searchsorted(v_grid, v_query.unsqueeze(-1), right=False).squeeze(-1)
+    idx_hi = torch.clamp(idx_hi, 1, v_grid.shape[1] - 1)
+    idx_lo = idx_hi - 1
+    b = torch.arange(v_grid.shape[0], device=v_grid.device)
+    v0 = v_grid[b, idx_lo]
+    v1 = v_grid[b, idx_hi]
+    y0 = y_grid[b, idx_lo]
+    y1 = y_grid[b, idx_hi]
+    t = (v_query - v0) / torch.clamp(v1 - v0, min=1e-6)
+    return y0 + t * (y1 - y0)
+
+
+def pinn_zone_offset_loss(zone_logits, offset_pred, step_ratio_raw, batch, cfg: Config, zone_edges_t: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
+    y_zone = batch["y_zone"]
+    y_offset = batch["y_offset"]
+    y_step_ratio = batch["y_step_ratio"]
+    dense_vhat = batch["dense_vhat"]
+    dense_pratio = batch["dense_pratio"]
+
+    pred_vhat, zone_probs, _, _ = compute_pred_vhat(zone_logits, offset_pred, zone_edges_t)
+    pred_vhat = pred_vhat.requires_grad_(True)
+    pred_pratio = interp_batch_1d(pred_vhat, dense_vhat, dense_pratio)
+    dP_dV = torch.autograd.grad(pred_pratio.sum(), pred_vhat, create_graph=True)[0]
+
+    zone_loss = nn.functional.cross_entropy(zone_logits, y_zone, label_smoothing=cfg.label_smoothing)
+    offset_loss = nn.functional.smooth_l1_loss(offset_pred, y_offset)
+
+    # power-first term: maximize normalized power at the predicted point
+    power_loss = torch.mean(1.0 - torch.clamp(pred_pratio, 0.0, 2.0))
+
+    # physics-informed MPP condition on the learned prediction
+    pinn_mpp = torch.mean(dP_dV ** 2)
+
+    # bounds / sanity
+    pinn_bound = torch.mean(torch.relu(zone_edges_t[0] - pred_vhat) + torch.relu(pred_vhat - zone_edges_t[-1]))
+
+    step_ratio_pred = cfg.po_min_step_ratio + (cfg.po_max_step_ratio - cfg.po_min_step_ratio) * step_ratio_raw
+    step_loss = nn.functional.smooth_l1_loss(step_ratio_pred, y_step_ratio)
+
+    total = (
+        cfg.zone_loss_weight * zone_loss
+        + cfg.offset_loss_weight * offset_loss
+        + cfg.power_loss_weight * power_loss
+        + cfg.pinn_mpp_weight * pinn_mpp
+        + cfg.pinn_boundary_weight * pinn_bound
+        + cfg.step_loss_weight * step_loss
+    )
+
+    parts = {
+        "zone": float(zone_loss.detach().cpu()),
+        "offset": float(offset_loss.detach().cpu()),
+        "power": float(power_loss.detach().cpu()),
+        "pinn_mpp": float(pinn_mpp.detach().cpu()),
+        "pinn_bound": float(pinn_bound.detach().cpu()),
+        "step": float(step_loss.detach().cpu()),
+    }
+    return total, parts
+
+# =========================================================
+# TRAIN / PREDICT
+# =========================================================
+def rows_to_arrays(rows: List[Dict[str, Any]]) -> Dict[str, np.ndarray]:
+    out = {
+        "x": np.stack([r["x"] for r in rows], axis=0).astype(np.float32),
+        "y_zone": np.asarray([r["y_zone"] for r in rows], dtype=np.int64),
+        "y_offset": np.asarray([r["y_offset"] for r in rows], dtype=np.float32),
+        "y_step_ratio": np.asarray([r["y_step_ratio"] for r in rows], dtype=np.float32),
+        "dense_vhat": np.stack([r["dense_vhat"] for r in rows], axis=0).astype(np.float32),
+        "dense_pratio": np.stack([r["dense_pratio"] for r in rows], axis=0).astype(np.float32),
+    }
+    return out
+
+
+def fit_standardizer(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    mu = X.mean(axis=0, keepdims=True).astype(np.float32)
+    sd = (X.std(axis=0, keepdims=True) + 1e-8).astype(np.float32)
+    return mu, sd
+
+
+def apply_standardizer(X: np.ndarray, mu: np.ndarray, sd: np.ndarray) -> np.ndarray:
+    return ((X - mu) / sd).astype(np.float32)
+
+
+def train_model(sim_rows: List[Dict[str, Any]], cfg: Config):
+    idx = np.arange(len(sim_rows))
+    idx_tr, idx_va = train_test_split(idx, test_size=cfg.sim_holdout_fraction, random_state=cfg.seed, shuffle=True)
+    train_rows = [sim_rows[i] for i in idx_tr]
+    val_rows = [sim_rows[i] for i in idx_va]
+
+    tr = rows_to_arrays(train_rows)
+    va = rows_to_arrays(val_rows)
+    mu, sd = fit_standardizer(tr["x"])
+    tr_x = apply_standardizer(tr["x"], mu, sd)
+    va_x = apply_standardizer(va["x"], mu, sd)
+
+    model = PINNZoneOffsetPOANN(in_dim=tr_x.shape[1], n_zones=cfg.n_zones, cfg=cfg).to(cfg.device)
+    optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=cfg.lr_plateau_patience)
+    zone_edges_t = torch.tensor(cfg.zone_edges, dtype=torch.float32, device=cfg.device)
+
+    best_val = float('inf')
+    best_state = None
+    patience = cfg.early_stop_patience
+    history: List[Dict[str, float]] = []
+
+    for ep in range(1, cfg.epochs + 1):
+        model.train()
+        perm = np.random.permutation(len(tr_x))
+        train_loss_sum = 0.0
+        n_seen = 0
+        train_parts_acc = {k: 0.0 for k in ["zone", "offset", "power", "pinn_mpp", "pinn_bound", "step"]}
+        for st in range(0, len(perm), cfg.batch_size):
+            bi = perm[st:st + cfg.batch_size]
+            if len(bi) < 2:
+                continue
+            batch = {
+                "x_std": torch.tensor(tr_x[bi], dtype=torch.float32, device=cfg.device),
+                "y_zone": torch.tensor(tr["y_zone"][bi], dtype=torch.long, device=cfg.device),
+                "y_offset": torch.tensor(tr["y_offset"][bi], dtype=torch.float32, device=cfg.device),
+                "y_step_ratio": torch.tensor(tr["y_step_ratio"][bi], dtype=torch.float32, device=cfg.device),
+                "dense_vhat": torch.tensor(tr["dense_vhat"][bi], dtype=torch.float32, device=cfg.device),
+                "dense_pratio": torch.tensor(tr["dense_pratio"][bi], dtype=torch.float32, device=cfg.device),
+            }
+            optimizer.zero_grad()
+            zone_logits, offset_pred, step_ratio_raw = model(batch["x_std"])
+            loss, parts = pinn_zone_offset_loss(zone_logits, offset_pred, step_ratio_raw, batch, cfg, zone_edges_t)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            bs = len(bi)
+            train_loss_sum += float(loss.detach().cpu()) * bs
+            n_seen += bs
+            for k in train_parts_acc:
+                train_parts_acc[k] += parts[k] * bs
+
+        avg_train_loss = train_loss_sum / max(n_seen, 1)
+        for k in train_parts_acc:
+            train_parts_acc[k] /= max(n_seen, 1)
+
+        model.eval()
+        with torch.no_grad():
+            vb = {
+                "x_std": torch.tensor(va_x, dtype=torch.float32, device=cfg.device),
+                "y_zone": torch.tensor(va["y_zone"], dtype=torch.long, device=cfg.device),
+                "y_offset": torch.tensor(va["y_offset"], dtype=torch.float32, device=cfg.device),
+                "y_step_ratio": torch.tensor(va["y_step_ratio"], dtype=torch.float32, device=cfg.device),
+                "dense_vhat": torch.tensor(va["dense_vhat"], dtype=torch.float32, device=cfg.device),
+                "dense_pratio": torch.tensor(va["dense_pratio"], dtype=torch.float32, device=cfg.device),
+            }
+            zone_logits, offset_pred, step_ratio_raw = model(vb["x_std"])
+            # re-enable grad only for pred_vhat derivative term by recomputing without no_grad
+        model.eval()
+        vb = {
+            "x_std": torch.tensor(va_x, dtype=torch.float32, device=cfg.device),
+            "y_zone": torch.tensor(va["y_zone"], dtype=torch.long, device=cfg.device),
+            "y_offset": torch.tensor(va["y_offset"], dtype=torch.float32, device=cfg.device),
+            "y_step_ratio": torch.tensor(va["y_step_ratio"], dtype=torch.float32, device=cfg.device),
+            "dense_vhat": torch.tensor(va["dense_vhat"], dtype=torch.float32, device=cfg.device),
+            "dense_pratio": torch.tensor(va["dense_pratio"], dtype=torch.float32, device=cfg.device),
+        }
+        zone_logits, offset_pred, step_ratio_raw = model(vb["x_std"])
+        val_loss, val_parts = pinn_zone_offset_loss(zone_logits, offset_pred, step_ratio_raw, vb, cfg, zone_edges_t)
+        pred_vhat, zone_probs, _, _ = compute_pred_vhat(zone_logits, offset_pred, zone_edges_t)
+        zone_acc = float((torch.argmax(zone_logits, dim=1) == vb["y_zone"]).float().mean().detach().cpu() * 100.0)
+        val_v_pct = float((torch.abs(pred_vhat - (0.5*(zone_edges_t[vb['y_zone']] + zone_edges_t[vb['y_zone']+1]) + 0.5*(zone_edges_t[vb['y_zone']+1]-zone_edges_t[vb['y_zone']])*vb['y_offset'])) / torch.clamp(torch.abs(0.5*(zone_edges_t[vb['y_zone']] + zone_edges_t[vb['y_zone']+1]) + 0.5*(zone_edges_t[vb['y_zone']+1]-zone_edges_t[vb['y_zone']])*vb['y_offset']), min=1e-6)).mean().detach().cpu() * 100.0)
+        val_loss_f = float(val_loss.detach().cpu())
+
+        history.append({
+            "epoch": ep,
+            "train_loss": avg_train_loss,
+            "val_loss": val_loss_f,
+            "zone_acc": zone_acc,
+            "val_v_pct": val_v_pct,
+            **{f"train_{k}": v for k, v in train_parts_acc.items()},
+            **{f"val_{k}": v for k, v in val_parts.items()},
+        })
+        print(
+            f"Epoch {ep:03d} | train={avg_train_loss:.6f} | val={val_loss_f:.6f} | zone_acc={zone_acc:.2f}% | "
+            f"val_v_pct={val_v_pct:.3f}% | val_power={val_parts['power']:.4f} | val_mpp={val_parts['pinn_mpp']:.4f}"
+        )
+        scheduler.step(val_loss_f)
+        if val_loss_f < best_val - 1e-6:
+            best_val = val_loss_f
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            patience = cfg.early_stop_patience
+        else:
+            patience -= 1
+            if patience <= 0:
+                print("Early stopping triggered.")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, mu, sd, history, train_rows, val_rows
+
+
+def predict_for_oracle(oracle: CurveOracle, model, mu: np.ndarray, sd: np.ndarray, cfg: Config) -> Dict[str, Any]:
+    feat = build_feature_vector(*oracle.curve_for_plot(), cfg.sample_fracs, cfg)
+    x_std = apply_standardizer(feat["x"][None, :], mu, sd)
+    x_t = torch.tensor(x_std, dtype=torch.float32, device=cfg.device)
+    zone_edges_t = torch.tensor(cfg.zone_edges, dtype=torch.float32, device=cfg.device)
+    model.eval()
+    with torch.no_grad():
+        zone_logits, offset_pred, step_ratio_raw = model(x_t)
+        pred_vhat, zone_probs, _, zone_conf = compute_pred_vhat(zone_logits, offset_pred, zone_edges_t)
+        step_ratio = cfg.po_min_step_ratio + (cfg.po_max_step_ratio - cfg.po_min_step_ratio) * step_ratio_raw
+    pred_vhat_f = float(pred_vhat.detach().cpu().numpy().ravel()[0])
+    V_pred = float(np.clip(pred_vhat_f * oracle.voc, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
+    P_pred = float(oracle.power_at(V_pred))
+    return {
+        "feature": feat,
+        "zone_conf": float(zone_conf.detach().cpu().numpy().ravel()[0]),
+        "pred_vhat": pred_vhat_f,
+        "V_pred": V_pred,
+        "P_pred": P_pred,
+        "step_ratio": float(step_ratio.detach().cpu().numpy().ravel()[0]),
+    }
+
+# =========================================================
+# LOCAL P&O (adjusted step size, ANN seed only)
+# =========================================================
+def local_po_adjusted(oracle: CurveOracle, v_seed: float, step_ratio: float, cfg: Config) -> Tuple[float, float, List[Tuple[float, float]]]:
+    voc = max(oracle.voc, 1e-9)
+    step = float(np.clip(step_ratio, cfg.po_min_step_ratio, cfg.po_max_step_ratio)) * voc
+    v_now = float(np.clip(v_seed, cfg.sample_fracs_min * voc, cfg.sample_fracs_max * voc))
+    p_now = oracle.power_at(v_now)
+    trace = [(v_now, p_now)]
+
+    # initial probing
+    v_left = float(np.clip(v_now - step, cfg.sample_fracs_min * voc, cfg.sample_fracs_max * voc))
+    v_right = float(np.clip(v_now + step, cfg.sample_fracs_min * voc, cfg.sample_fracs_max * voc))
+    p_left = oracle.power_at(v_left)
+    p_right = oracle.power_at(v_right)
+    trace.extend([(v_left, p_left), (v_right, p_right)])
+
+    if p_left > p_now and p_left >= p_right:
+        direction = -1.0
+        v_now, p_now = v_left, p_left
+    elif p_right > p_now:
+        direction = 1.0
+        v_now, p_now = v_right, p_right
+    else:
+        direction = 1.0 if p_right >= p_left else -1.0
+        step *= cfg.po_step_shrink
+
+    for _ in range(cfg.po_iterations):
+        v_try = float(np.clip(v_now + direction * step, cfg.sample_fracs_min * voc, cfg.sample_fracs_max * voc))
+        p_try = oracle.power_at(v_try)
+        trace.append((v_try, p_try))
+        gain_ratio = (p_try - p_now) / max(abs(p_now), 1e-9)
+        if p_try > p_now:
+            v_now, p_now = v_try, p_try
+            step = min(step * cfg.po_step_growth, cfg.po_max_step_ratio * voc)
+            if gain_ratio < cfg.po_stop_gain_ratio:
+                break
+        else:
+            direction *= -1.0
+            step = max(step * cfg.po_step_shrink, cfg.po_min_step_ratio * voc)
+            if step <= cfg.po_min_step_ratio * voc + 1e-12:
+                break
+    return float(v_now), float(p_now), trace
+
+
+def coarse12_baseline(oracle: CurveOracle, cfg: Config) -> Tuple[float, float, np.ndarray, np.ndarray]:
+    vq = (cfg.sample_fracs * oracle.voc).astype(float)
+    pq = np.array([oracle.power_at(v) for v in vq], dtype=float)
+    k = int(np.argmax(pq))
+    return float(vq[k]), float(pq[k]), vq, pq
+
+# =========================================================
+# EVALUATION
+# =========================================================
+def evaluate_ann_only(curves, model, mu, sd, cfg: Config):
+    rows: List[Dict[str, Any]] = []
+    for idx, item in enumerate(curves[: cfg.max_eval_curves]):
+        oracle = CurveOracle(item)
+        if oracle.voc <= 0 or oracle.pmpp_true <= 0:
+            continue
+        pred = predict_for_oracle(oracle, model, mu, sd, cfg)
+        rows.append({
+            "curve_idx": idx,
+            "Voc": float(oracle.voc),
+            "V_true": float(oracle.vmpp_true),
+            "P_true": float(oracle.pmpp_true),
+            "V_ann": pred["V_pred"],
+            "P_ann": pred["P_pred"],
+            "ann_ratio_pct": 100.0 * pred["P_pred"] / max(oracle.pmpp_true, 1e-9),
+            "ann_power_regret_pct": 100.0 * max(oracle.pmpp_true - pred["P_pred"], 0.0) / max(oracle.pmpp_true, 1e-9),
+            "ann_vdiff_pct": 100.0 * abs(pred["V_pred"] - oracle.vmpp_true) / max(abs(oracle.vmpp_true), 1e-9),
+            "zone_conf": pred["zone_conf"],
+            "ann_step_ratio": pred["step_ratio"],
+            "dense_peak_count": int(oracle.dense_peak_count),
+        })
+    df = pd.DataFrame(rows)
+    if len(df) == 0:
+        return {}, df
+    summary = {
+        "mean_ann_ratio_pct": float(df["ann_ratio_pct"].mean()),
+        "median_ann_ratio_pct": float(df["ann_ratio_pct"].median()),
+        "mean_ann_power_regret_pct": float(df["ann_power_regret_pct"].mean()),
+        "median_ann_power_regret_pct": float(df["ann_power_regret_pct"].median()),
+        "max_ann_power_regret_pct": float(df["ann_power_regret_pct"].max()),
+        "mean_ann_vdiff_pct": float(df["ann_vdiff_pct"].mean()),
+        "median_ann_vdiff_pct": float(df["ann_vdiff_pct"].median()),
+        "ann_within_99pct_power_rate": float(100.0 * (df["ann_ratio_pct"] >= 99.0).mean()),
+        "ann_within_98pct_power_rate": float(100.0 * (df["ann_ratio_pct"] >= 98.0).mean()),
+        "ann_within_95pct_power_rate": float(100.0 * (df["ann_ratio_pct"] >= 95.0).mean()),
+        "mean_zone_conf": float(df["zone_conf"].mean()),
+        "mean_ann_step_ratio": float(df["ann_step_ratio"].mean()),
+    }
+    return summary, df
+
+
+def evaluate_ann_plus_po(curves, model, mu, sd, cfg: Config):
+    rows: List[Dict[str, Any]] = []
+    examples: List[Dict[str, Any]] = []
+    for idx, item in enumerate(curves[: cfg.max_eval_curves]):
+        oracle = CurveOracle(item)
+        if oracle.voc <= 0 or oracle.pmpp_true <= 0:
+            continue
+        pred = predict_for_oracle(oracle, model, mu, sd, cfg)
+        V_samples = (cfg.sample_fracs * oracle.voc).astype(float)
+        P_samples = np.array([oracle.power_at(vq) for vq in V_samples], dtype=float)
+        V_final, P_final, po_trace = local_po_adjusted(oracle, pred["V_pred"], pred["step_ratio"], cfg)
+        row = {
+            "curve_idx": idx,
+            "Voc": float(oracle.voc),
+            "V_true": float(oracle.vmpp_true),
+            "P_true": float(oracle.pmpp_true),
+            "V_ann": pred["V_pred"],
+            "P_ann": pred["P_pred"],
+            "V_final": V_final,
+            "P_final": P_final,
+            "ann_ratio_pct": 100.0 * pred["P_pred"] / max(oracle.pmpp_true, 1e-9),
+            "ann_power_regret_pct": 100.0 * max(oracle.pmpp_true - pred["P_pred"], 0.0) / max(oracle.pmpp_true, 1e-9),
+            "ann_vdiff_pct": 100.0 * abs(pred["V_pred"] - oracle.vmpp_true) / max(abs(oracle.vmpp_true), 1e-9),
+            "final_ratio_pct": 100.0 * P_final / max(oracle.pmpp_true, 1e-9),
+            "final_power_regret_pct": 100.0 * max(oracle.pmpp_true - P_final, 0.0) / max(oracle.pmpp_true, 1e-9),
+            "final_vdiff_pct": 100.0 * abs(V_final - oracle.vmpp_true) / max(abs(oracle.vmpp_true), 1e-9),
+            "zone_conf": pred["zone_conf"],
+            "ann_step_ratio": pred["step_ratio"],
+            "dense_peak_count": int(oracle.dense_peak_count),
+        }
+        rows.append(row)
+        examples.append({
+            **row,
+            "oracle": oracle,
+            "V_samples": V_samples,
+            "P_samples": P_samples,
+            "po_trace": po_trace,
+            "plot_peak_count": int(oracle.dense_peak_count),
+            "peak_prominence_score": float(oracle.peak_prominence_score),
+            "v_dense": oracle.v_dense,
+            "p_dense": oracle.p_dense,
+        })
+    df = pd.DataFrame(rows)
+    if len(df) == 0:
+        return {}, df, examples
+    summary = {
+        "mean_ann_ratio_pct": float(df["ann_ratio_pct"].mean()),
+        "median_ann_ratio_pct": float(df["ann_ratio_pct"].median()),
+        "mean_ann_power_regret_pct": float(df["ann_power_regret_pct"].mean()),
+        "mean_ann_vdiff_pct": float(df["ann_vdiff_pct"].mean()),
+        "ann_within_99pct_power_rate": float(100.0 * (df["ann_ratio_pct"] >= 99.0).mean()),
+        "ann_within_98pct_power_rate": float(100.0 * (df["ann_ratio_pct"] >= 98.0).mean()),
+        "ann_within_95pct_power_rate": float(100.0 * (df["ann_ratio_pct"] >= 95.0).mean()),
+        "mean_final_ratio_pct": float(df["final_ratio_pct"].mean()),
+        "median_final_ratio_pct": float(df["final_ratio_pct"].median()),
+        "mean_final_power_regret_pct": float(df["final_power_regret_pct"].mean()),
+        "median_final_power_regret_pct": float(df["final_power_regret_pct"].median()),
+        "max_final_power_regret_pct": float(df["final_power_regret_pct"].max()),
+        "mean_final_vdiff_pct": float(df["final_vdiff_pct"].mean()),
+        "final_within_99pct_power_rate": float(100.0 * (df["final_ratio_pct"] >= 99.0).mean()),
+        "final_within_98pct_power_rate": float(100.0 * (df["final_ratio_pct"] >= 98.0).mean()),
+        "final_within_95pct_power_rate": float(100.0 * (df["final_ratio_pct"] >= 95.0).mean()),
+        "mean_zone_conf": float(df["zone_conf"].mean()),
+        "mean_ann_step_ratio": float(df["ann_step_ratio"].mean()),
+    }
+    return summary, df, examples
+
+# =========================================================
+# VISUALIZATION
+# =========================================================
+
+# =========================================================
+# VISUALIZATION
+# =========================================================
+def select_visualization_examples(examples: List[Dict[str, Any]], n_viz: int = 8):
+    if len(examples) == 0:
+        return [], 'none'
+    true_multi = [e for e in examples if int(e.get('plot_peak_count', 0)) >= 2]
+    if len(true_multi) > 0:
+        chosen = sorted(true_multi, key=lambda x: (x.get('peak_prominence_score', 0.0), x.get('final_ratio_pct', 0.0)), reverse=True)[:n_viz]
+        return chosen, 'true_two_peak'
+    chosen = sorted(examples, key=lambda x: (x.get('peak_prominence_score', 0.0), x.get('final_ratio_pct', 0.0)), reverse=True)[:n_viz]
+    return chosen, 'highest_prominence_fallback'
+
+
+def plot_training_histories(history: List[Dict[str, float]]):
+    df = pd.DataFrame(history)
+    if len(df) == 0:
+        return
+    plt.figure(figsize=(10, 5))
+    plt.plot(df['epoch'], df['train_loss'], label='train_loss')
+    plt.plot(df['epoch'], df['val_loss'], label='val_loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.show()
+
+
+def visualize_examples_from_full_shaded_pool(examples: List[Dict[str, Any]], n_viz: int = 8):
+    chosen, mode = select_visualization_examples(examples, n_viz=n_viz)
+    if len(chosen) == 0:
+        print('No valid shaded-experimental visualization examples were found.')
+        return
+    if mode == 'true_two_peak':
+        print('Visualization mode: strongest true two-peak curves from the full shaded-experimental pool')
+    else:
+        print('Visualization mode: no curves passed the strict two-peak threshold; showing highest-prominence shaded curves instead')
+    n_rows = int(np.ceil(len(chosen) / 2))
+    fig, axes = plt.subplots(n_rows, 2, figsize=(15, 4 * n_rows))
+    axes = np.atleast_1d(axes).ravel()
+    for ax in axes[len(chosen):]:
+        ax.axis('off')
+    for ax, item in zip(axes[:len(chosen)], chosen):
+        oracle = item['oracle']
+        v_plot = item.get('v_dense', None)
+        p_plot = item.get('p_dense', None)
+        if v_plot is None or len(v_plot) == 0:
+            v, i = oracle.curve_for_plot()
+            v_plot, p_plot = prepare_pv_plot_curve(v, i)
+        ax.plot(v_plot, p_plot, label='Plot-ready P-V curve')
+        ax.scatter(item['V_samples'], item['P_samples'], s=20, alpha=0.65, label='12 sample points')
+        ax.scatter([oracle.vmpp_true], [oracle.pmpp_true], marker='*', s=160, label='True MPP', zorder=5)
+        ax.scatter([item['V_ann']], [item['P_ann']], marker='x', s=90, label='ANN stage', zorder=6)
+        ax.scatter([item['V_final']], [item['P_final']], marker='D', s=70, label='ANN + local P&O', zorder=6)
+        if item.get('po_trace'):
+            po_v = [vp[0] for vp in item['po_trace']]
+            po_p = [vp[1] for vp in item['po_trace']]
+            ax.plot(po_v, po_p, linestyle='--', alpha=0.6, label='Local P&O trace')
+        ax.set_title(
+            f"Curve {item['curve_idx']} | peaks={item.get('plot_peak_count', 0)} | "
+            f"ANN={item['ann_ratio_pct']:.2f}% | Final={item['final_ratio_pct']:.2f}%"
+        )
+        ax.set_xlabel('Voltage (V)')
+        ax.set_ylabel('Power (W)')
+        ax.grid(True, alpha=0.3)
+    axes[0].legend(loc='best')
+    plt.tight_layout()
+    plt.show()
+
+# =========================================================
+# RUN PIPELINE
+# =========================================================
+
+# =========================================================
+# RUN PIPELINE
+# =========================================================
+sim_curves, exp_sh_curves, exp_ok_curves = load_dataset(DATASET_PATH)
+
+print("\nBuilding cleaned training dataset from simulated curves...")
+sim_rows, sim_stats = build_dataset_from_curves(sim_curves, cfg)
+exp_sh_rows, exp_sh_stats = build_dataset_from_curves(exp_sh_curves, cfg)
+exp_ok_rows, exp_ok_stats = build_dataset_from_curves(exp_ok_curves, cfg) if len(exp_ok_curves) > 0 else ([], {})
+
+print("\n=== CLEANING / PREPROCESSING SUMMARY ===")
+print("Simulated stats:", sim_stats)
+print("Shaded experimental stats:", exp_sh_stats)
+if REPORT_OK_EXPERIMENTAL_AUX:
+    print("Ok experimental stats:", exp_ok_stats)
+
+if len(sim_rows) == 0:
+    raise RuntimeError("No valid simulated training samples after preprocessing.")
+if len(exp_sh_rows) == 0:
+    raise RuntimeError("No valid shaded experimental samples after preprocessing.")
+
+print("Feature matrix shape:", rows_to_arrays(sim_rows)["x"].shape)
+print("Target type: 12-point samples -> ANN (zone+offset+step) -> local adjusted-step P&O")
+print("Input dimension:", rows_to_arrays(sim_rows)["x"].shape[1])
+print("Number of zones:", cfg.n_zones)
+print("Zone edges:", cfg.zone_edges)
+
+print("\nTraining PINN-guided Zone-and-Offset ANN...")
+model, mu, sd, history, sim_train_rows, sim_holdout_rows = train_model(sim_rows, cfg)
+
+print("\nQuantitative evaluation source: full unseen shaded-experimental set")
+ann_summary_exp_sh, ann_df_exp_sh = evaluate_ann_only([r['curve'] for r in exp_sh_rows], model, mu, sd, cfg)
+hybrid_summary_exp_sh, hybrid_df_exp_sh, exp_sh_examples = evaluate_ann_plus_po([r['curve'] for r in exp_sh_rows], model, mu, sd, cfg)
+
+ann_summary_sim_hold, ann_df_sim_hold = evaluate_ann_only([r['curve'] for r in sim_holdout_rows], model, mu, sd, cfg)
+
+print("\n=== SIM HOLDOUT ANN-ONLY SUMMARY ===")
+for k, v in ann_summary_sim_hold.items():
+    print(f"{k}: {v}")
+
+print("\n=== EXP SHADED ANN-ONLY SUMMARY ===")
+for k, v in ann_summary_exp_sh.items():
+    print(f"{k}: {v}")
+
+print("\n=== EXP SHADED ANN + LOCAL P&O SUMMARY ===")
+for k, v in hybrid_summary_exp_sh.items():
+    print(f"{k}: {v}")
+
+print("\nUnseen shaded experimental ANN-only head:")
+display(ann_df_exp_sh.head(10))
+print("\nUnseen shaded experimental ANN + local P&O head:")
+display(hybrid_df_exp_sh.head(10))
+
+if REPORT_OK_EXPERIMENTAL_AUX and len(exp_ok_rows) > 0:
+    print("\n=== AUXILIARY OK EXPERIMENTAL ANN + LOCAL P&O SUMMARY ===")
+    ok_summary, ok_df, _ = evaluate_ann_plus_po([r['curve'] for r in exp_ok_rows], model, mu, sd, cfg)
+    for k, v in ok_summary.items():
+        print(f"{k}: {v}")
+    display(ok_df.head(10))
+
+if MAKE_PLOTS:
+    plot_training_histories(history)
+    visualize_examples_from_full_shaded_pool(exp_sh_examples, n_viz=cfg.n_viz)
+
+if SAVE_MODEL_BUNDLE:
+    bundle = {
+        "config": cfg.__dict__,
+        "mu": mu,
+        "sd": sd,
+        "history": history,
+        "ann_summary_exp_sh": ann_summary_exp_sh,
+        "hybrid_summary_exp_sh": hybrid_summary_exp_sh,
+        "state_dict": model.state_dict(),
+    }
+    save_path = "zone_offset_ann_pinn_12sample_ann_po_bundle.pt"
+    torch.save(bundle, save_path)
+    print("\nSaved model bundle to:", save_path)
