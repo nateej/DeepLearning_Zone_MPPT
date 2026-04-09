@@ -52,8 +52,8 @@ class Config:
 
     # sequence + TCNformer
     n_zones: int = 4
-    seq_len: int = 13
-    seq_features: int = 4
+    seq_len: int = 52
+    seq_features: int = 1
     tcn_channels: int = 64
     tcn_layers: int = 3
     transformer_heads: int = 4
@@ -75,6 +75,9 @@ class Config:
     # loss weights
     w_data: float = 1.0
     w_physics: float = 0.25
+    physics_weight_min_scale: float = 0.05
+    physics_weight_max_scale: float = 5.0
+    max_grad_norm: float = 1.0
 
     # local P&O
     po_iterations: int = 14
@@ -571,6 +574,7 @@ def build_feature_vector(v: np.ndarray, i: np.ndarray, sample_fracs: np.ndarray,
         "y_offset": np.float32(y_offset),
         "y_step_ratio": np.float32(y_step_ratio),
         "sparse_vhat": v_norm.astype(np.float32),
+        "sparse_ihat": i_norm.astype(np.float32),
         "sparse_phat": p_norm.astype(np.float32),
         "dense_vhat": np.linspace(cfg.sample_fracs_min, cfg.sample_fracs_max, 256, dtype=np.float32),
         "dense_pratio": np.interp(
@@ -663,9 +667,9 @@ class PhysicsInformedTCNformer(nn.Module):
             nn.Dropout(cfg.dropout),
             nn.LayerNorm(cfg.latent_dim),
         )
-        self.zone_head = nn.Sequential(nn.Linear(cfg.latent_dim, n_zones), nn.Softmax(dim=1))
-        self.offset_head = nn.Sequential(nn.Linear(cfg.latent_dim, 1), nn.Tanh())
-        self.step_head = nn.Sequential(nn.Linear(cfg.latent_dim, 1), nn.Sigmoid())
+        self.zone_head = nn.Linear(cfg.latent_dim, n_zones)
+        self.offset_head = nn.Linear(cfg.latent_dim, 1)
+        self.step_head = nn.Linear(cfg.latent_dim, 1)
 
     def forward(self, x: torch.Tensor):
         hist = x[:, : self.seq_len * self.seq_features]
@@ -682,9 +686,12 @@ class PhysicsInformedTCNformer(nn.Module):
         h = self.temporal_ln(h.mean(dim=1))
         fused = self.fusion(torch.cat([h, env], dim=1))
 
-        zone_probs = self.zone_head(fused)
-        offset = self.offset_head(fused).squeeze(-1)
-        step_ratio_raw = self.step_head(fused).squeeze(-1)
+        zone_logits = self.zone_head(fused)
+        offset_raw = self.offset_head(fused).squeeze(-1)
+        step_raw = self.step_head(fused).squeeze(-1)
+        zone_probs = nn.functional.softmax(zone_logits, dim=1)
+        offset = torch.tanh(offset_raw)
+        step_ratio_raw = torch.sigmoid(step_raw)
         step_ratio = self.cfg.po_min_step_ratio + (self.cfg.po_max_step_ratio - self.cfg.po_min_step_ratio) * step_ratio_raw
         return zone_probs, offset, step_ratio
 
@@ -737,7 +744,12 @@ def pinn_zone_offset_loss(zone_probs, offset_pred, step_ratio_pred, batch, cfg: 
     physics_loss = torch.mean(physics_term)
 
     data_loss = 1.0 * zone_loss + 0.5 * offset_loss + 0.5 * step_loss
-    total = cfg.w_data * data_loss + cfg.w_physics * physics_loss
+    relative_scale = (data_loss.detach() / torch.clamp(physics_loss.detach(), min=1e-8)).clamp(
+        cfg.physics_weight_min_scale,
+        cfg.physics_weight_max_scale,
+    )
+    w_physics_dynamic = cfg.w_physics * relative_scale
+    total = cfg.w_data * data_loss + w_physics_dynamic * physics_loss
 
     parts = {
         "zone": float(zone_loss.detach().cpu()),
@@ -745,6 +757,7 @@ def pinn_zone_offset_loss(zone_probs, offset_pred, step_ratio_pred, batch, cfg: 
         "step": float(step_loss.detach().cpu()),
         "physics": float(physics_loss.detach().cpu()),
         "data": float(data_loss.detach().cpu()),
+        "w_physics_dynamic": float(w_physics_dynamic.detach().cpu()),
     }
     return total, parts
 
@@ -752,8 +765,8 @@ def pinn_zone_offset_loss(zone_probs, offset_pred, step_ratio_pred, batch, cfg: 
 # TRAIN / PREDICT
 # =========================================================
 def rows_to_arrays(rows: List[Dict[str, Any]]) -> Dict[str, np.ndarray]:
-    seq_vhat = np.stack([r["x"][: cfg.seq_len * cfg.seq_features].reshape(cfg.seq_len, cfg.seq_features)[:, 0] for r in rows], axis=0).astype(np.float32)
-    seq_ihat = np.stack([r["x"][: cfg.seq_len * cfg.seq_features].reshape(cfg.seq_len, cfg.seq_features)[:, 1] for r in rows], axis=0).astype(np.float32)
+    seq_vhat = np.stack([r["sparse_vhat"] for r in rows], axis=0).astype(np.float32)
+    seq_ihat = np.stack([r["sparse_ihat"] for r in rows], axis=0).astype(np.float32)
     out = {
         "x": np.stack([r["x"] for r in rows], axis=0).astype(np.float32),
         "y_zone": np.asarray([r["y_zone"] for r in rows], dtype=np.int64),
@@ -839,7 +852,7 @@ def train_model(sim_rows: List[Dict[str, Any]], cfg: Config):
         perm = np.random.permutation(len(tr_x))
         train_loss_sum = 0.0
         n_seen = 0
-        train_parts_acc = {k: 0.0 for k in ["zone", "offset", "step", "physics", "data"]}
+        train_parts_acc = {k: 0.0 for k in ["zone", "offset", "step", "physics", "data", "w_physics_dynamic"]}
         for st in range(0, len(perm), cfg.batch_size):
             bi = perm[st:st + cfg.batch_size]
             if len(bi) < 2:
@@ -857,9 +870,8 @@ def train_model(sim_rows: List[Dict[str, Any]], cfg: Config):
             zone_probs, offset_pred, step_ratio_pred = model(batch["x_std"])
             loss, parts = pinn_zone_offset_loss(zone_probs, offset_pred, step_ratio_pred, batch, cfg, zone_edges_t)
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
             optimizer.step()
-            scheduler.step(ep - 1 + st / max(len(perm), 1))
             bs = len(bi)
             train_loss_sum += float(loss.detach().cpu()) * bs
             n_seen += bs
@@ -882,6 +894,7 @@ def train_model(sim_rows: List[Dict[str, Any]], cfg: Config):
         }
         zone_probs, offset_pred, step_ratio_pred = model(vb["x_std"])
         val_loss, val_parts = pinn_zone_offset_loss(zone_probs, offset_pred, step_ratio_pred, vb, cfg, zone_edges_t)
+        scheduler.step(ep)
         pred_vhat, zone_probs, _, _ = compute_pred_vhat(zone_probs, offset_pred, zone_edges_t)
         zone_acc = float((torch.argmax(zone_probs, dim=1) == vb["y_zone"]).float().mean().detach().cpu() * 100.0)
         convergence_steps = compute_transient_convergence_steps(pred_vhat, step_ratio_pred, vb["true_vhat"], cfg)
@@ -901,7 +914,7 @@ def train_model(sim_rows: List[Dict[str, Any]], cfg: Config):
         print(
             f"Epoch {ep:03d} | train={avg_train_loss:.6f} | val={val_loss_f:.6f} | zone_acc={zone_acc:.2f}% | "
             f"val_v_pct={val_v_pct:.3f}% | val_data={val_parts['data']:.4f} | val_physics={val_parts['physics']:.4f} | "
-            f"convergence_steps={convergence_steps:.2f}"
+            f"w_phys_dyn={val_parts['w_physics_dynamic']:.4f} | convergence_steps={convergence_steps:.2f}"
         )
         if val_loss_f < best_val - cfg.early_stop_min_delta:
             best_val = val_loss_f
