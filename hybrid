@@ -52,8 +52,8 @@ class Config:
 
     # sequence + TCNformer
     n_zones: int = 4
-    seq_len: int = 52
-    seq_features: int = 1
+    seq_len: int = 12
+    seq_features: int = 4
     tcn_channels: int = 64
     tcn_layers: int = 3
     transformer_heads: int = 4
@@ -285,6 +285,8 @@ def clean_iv_curve_strict(v: np.ndarray, i: np.ndarray) -> Tuple[np.ndarray, np.
 
     mask = np.isfinite(v) & np.isfinite(i)
     v, i = v[mask], i[mask]
+    v = np.clip(v, a_min=0.0, a_max=None)
+    i = np.clip(i, a_min=0.0, a_max=None)
     if len(v) < 3:
         return np.array([]), np.array([])
 
@@ -551,14 +553,17 @@ def build_feature_vector(v: np.ndarray, i: np.ndarray, sample_fracs: np.ndarray,
         top_gap_ratio,
         multi_peak_count,
     ], dtype=np.float32)
-    env_feats = np.array([
-        np.log1p(voc),
-        np.log1p(max(np.max(np.abs(i)), 1e-9)),
-        np.log1p(max(pmpp_true, 1e-9)),
-        prom_score,
-    ], dtype=np.float32)
+    env_feats = np.concatenate([
+        hist_extra,
+        np.array([
+            np.log1p(voc),
+            np.log1p(max(np.max(np.abs(i)), 1e-9)),
+            np.log1p(max(pmpp_true, 1e-9)),
+            prom_score,
+        ], dtype=np.float32),
+    ], axis=0).astype(np.float32)
 
-    historical = np.concatenate([v_norm, i_norm, p_norm, dpdv.astype(np.float32), hist_extra], axis=0).astype(np.float32)
+    historical = np.stack([v_norm, i_norm, p_norm, dpdv.astype(np.float32)], axis=1).flatten().astype(np.float32)
     x = np.concatenate([historical, env_feats], axis=0).astype(np.float32)
     y_zone, y_offset = zone_index_and_offset(true_vhat, cfg.zone_edges)
 
@@ -636,7 +641,7 @@ class PhysicsInformedTCNformer(nn.Module):
     def __init__(self, in_dim: int, n_zones: int, cfg: Config):
         super().__init__()
         self.cfg = cfg
-        expected_in_dim = cfg.seq_len * cfg.seq_features + 4
+        expected_in_dim = cfg.seq_len * cfg.seq_features + 8
         if in_dim != expected_in_dim:
             raise ValueError(f"Expected input dim={expected_in_dim}, got {in_dim}")
         self.seq_len = cfg.seq_len
@@ -662,7 +667,7 @@ class PhysicsInformedTCNformer(nn.Module):
         self.norm2 = nn.LayerNorm(cfg.tcn_channels)
         self.temporal_ln = nn.LayerNorm(cfg.tcn_channels)
         self.fusion = nn.Sequential(
-            nn.Linear(cfg.tcn_channels + 4, cfg.latent_dim),
+            nn.Linear(cfg.tcn_channels + 8, cfg.latent_dim),
             nn.GELU(),
             nn.Dropout(cfg.dropout),
             nn.LayerNorm(cfg.latent_dim),
