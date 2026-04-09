@@ -1006,7 +1006,7 @@ def coarse12_baseline(oracle: CurveOracle, cfg: Config) -> Tuple[float, float, n
 # =========================================================
 # EVALUATION
 # =========================================================
-def evaluate_ann_only(curves, model, mu, sd, cfg: Config):
+def evaluate_tcnformer_only(curves, model, mu, sd, cfg: Config):
     rows: List[Dict[str, Any]] = []
     for idx, item in enumerate(curves[: cfg.max_eval_curves]):
         oracle = CurveOracle(item)
@@ -1018,36 +1018,36 @@ def evaluate_ann_only(curves, model, mu, sd, cfg: Config):
             "Voc": float(oracle.voc),
             "V_true": float(oracle.vmpp_true),
             "P_true": float(oracle.pmpp_true),
-            "V_ann": pred["V_pred"],
-            "P_ann": pred["P_pred"],
-            "ann_ratio_pct": 100.0 * pred["P_pred"] / max(oracle.pmpp_true, 1e-9),
-            "ann_power_regret_pct": 100.0 * max(oracle.pmpp_true - pred["P_pred"], 0.0) / max(oracle.pmpp_true, 1e-9),
-            "ann_vdiff_pct": 100.0 * abs(pred["V_pred"] - oracle.vmpp_true) / max(abs(oracle.vmpp_true), 1e-9),
+            "V_tcnformer": pred["V_pred"],
+            "P_tcnformer": pred["P_pred"],
+            "tcnformer_ratio_pct": 100.0 * pred["P_pred"] / max(oracle.pmpp_true, 1e-9),
+            "tcnformer_power_regret_pct": 100.0 * max(oracle.pmpp_true - pred["P_pred"], 0.0) / max(oracle.pmpp_true, 1e-9),
+            "tcnformer_vdiff_pct": 100.0 * abs(pred["V_pred"] - oracle.vmpp_true) / max(abs(oracle.vmpp_true), 1e-9),
             "zone_conf": pred["zone_conf"],
-            "ann_step_ratio": pred["step_ratio"],
+            "tcnformer_step_ratio": pred["step_ratio"],
             "dense_peak_count": int(oracle.dense_peak_count),
         })
     df = pd.DataFrame(rows)
     if len(df) == 0:
         return {}, df
     summary = {
-        "mean_ann_ratio_pct": float(df["ann_ratio_pct"].mean()),
-        "median_ann_ratio_pct": float(df["ann_ratio_pct"].median()),
-        "mean_ann_power_regret_pct": float(df["ann_power_regret_pct"].mean()),
-        "median_ann_power_regret_pct": float(df["ann_power_regret_pct"].median()),
-        "max_ann_power_regret_pct": float(df["ann_power_regret_pct"].max()),
-        "mean_ann_vdiff_pct": float(df["ann_vdiff_pct"].mean()),
-        "median_ann_vdiff_pct": float(df["ann_vdiff_pct"].median()),
-        "ann_within_99pct_power_rate": float(100.0 * (df["ann_ratio_pct"] >= 99.0).mean()),
-        "ann_within_98pct_power_rate": float(100.0 * (df["ann_ratio_pct"] >= 98.0).mean()),
-        "ann_within_95pct_power_rate": float(100.0 * (df["ann_ratio_pct"] >= 95.0).mean()),
+        "mean_tcnformer_ratio_pct": float(df["tcnformer_ratio_pct"].mean()),
+        "median_tcnformer_ratio_pct": float(df["tcnformer_ratio_pct"].median()),
+        "mean_tcnformer_power_regret_pct": float(df["tcnformer_power_regret_pct"].mean()),
+        "median_tcnformer_power_regret_pct": float(df["tcnformer_power_regret_pct"].median()),
+        "max_tcnformer_power_regret_pct": float(df["tcnformer_power_regret_pct"].max()),
+        "mean_tcnformer_vdiff_pct": float(df["tcnformer_vdiff_pct"].mean()),
+        "median_tcnformer_vdiff_pct": float(df["tcnformer_vdiff_pct"].median()),
+        "tcnformer_within_99pct_power_rate": float(100.0 * (df["tcnformer_ratio_pct"] >= 99.0).mean()),
+        "tcnformer_within_98pct_power_rate": float(100.0 * (df["tcnformer_ratio_pct"] >= 98.0).mean()),
+        "tcnformer_within_95pct_power_rate": float(100.0 * (df["tcnformer_ratio_pct"] >= 95.0).mean()),
         "mean_zone_conf": float(df["zone_conf"].mean()),
-        "mean_ann_step_ratio": float(df["ann_step_ratio"].mean()),
+        "mean_tcnformer_step_ratio": float(df["tcnformer_step_ratio"].mean()),
     }
     return summary, df
 
 
-def evaluate_ann_plus_po(curves, model, mu, sd, cfg: Config):
+def evaluate_tcnformer_plus_po(curves, model, mu, sd, cfg: Config):
     rows: List[Dict[str, Any]] = []
     examples: List[Dict[str, Any]] = []
     for idx, item in enumerate(curves[: cfg.max_eval_curves]):
@@ -1063,18 +1063,18 @@ def evaluate_ann_plus_po(curves, model, mu, sd, cfg: Config):
             "Voc": float(oracle.voc),
             "V_true": float(oracle.vmpp_true),
             "P_true": float(oracle.pmpp_true),
-            "V_ann": pred["V_pred"],
-            "P_ann": pred["P_pred"],
+            "V_tcnformer": pred["V_pred"],
+            "P_tcnformer": pred["P_pred"],
             "V_final": V_final,
             "P_final": P_final,
-            "ann_ratio_pct": 100.0 * pred["P_pred"] / max(oracle.pmpp_true, 1e-9),
-            "ann_power_regret_pct": 100.0 * max(oracle.pmpp_true - pred["P_pred"], 0.0) / max(oracle.pmpp_true, 1e-9),
-            "ann_vdiff_pct": 100.0 * abs(pred["V_pred"] - oracle.vmpp_true) / max(abs(oracle.vmpp_true), 1e-9),
+            "tcnformer_ratio_pct": 100.0 * pred["P_pred"] / max(oracle.pmpp_true, 1e-9),
+            "tcnformer_power_regret_pct": 100.0 * max(oracle.pmpp_true - pred["P_pred"], 0.0) / max(oracle.pmpp_true, 1e-9),
+            "tcnformer_vdiff_pct": 100.0 * abs(pred["V_pred"] - oracle.vmpp_true) / max(abs(oracle.vmpp_true), 1e-9),
             "final_ratio_pct": 100.0 * P_final / max(oracle.pmpp_true, 1e-9),
             "final_power_regret_pct": 100.0 * max(oracle.pmpp_true - P_final, 0.0) / max(oracle.pmpp_true, 1e-9),
             "final_vdiff_pct": 100.0 * abs(V_final - oracle.vmpp_true) / max(abs(oracle.vmpp_true), 1e-9),
             "zone_conf": pred["zone_conf"],
-            "ann_step_ratio": pred["step_ratio"],
+            "tcnformer_step_ratio": pred["step_ratio"],
             "dense_peak_count": int(oracle.dense_peak_count),
         }
         rows.append(row)
@@ -1093,13 +1093,13 @@ def evaluate_ann_plus_po(curves, model, mu, sd, cfg: Config):
     if len(df) == 0:
         return {}, df, examples
     summary = {
-        "mean_ann_ratio_pct": float(df["ann_ratio_pct"].mean()),
-        "median_ann_ratio_pct": float(df["ann_ratio_pct"].median()),
-        "mean_ann_power_regret_pct": float(df["ann_power_regret_pct"].mean()),
-        "mean_ann_vdiff_pct": float(df["ann_vdiff_pct"].mean()),
-        "ann_within_99pct_power_rate": float(100.0 * (df["ann_ratio_pct"] >= 99.0).mean()),
-        "ann_within_98pct_power_rate": float(100.0 * (df["ann_ratio_pct"] >= 98.0).mean()),
-        "ann_within_95pct_power_rate": float(100.0 * (df["ann_ratio_pct"] >= 95.0).mean()),
+        "mean_tcnformer_ratio_pct": float(df["tcnformer_ratio_pct"].mean()),
+        "median_tcnformer_ratio_pct": float(df["tcnformer_ratio_pct"].median()),
+        "mean_tcnformer_power_regret_pct": float(df["tcnformer_power_regret_pct"].mean()),
+        "mean_tcnformer_vdiff_pct": float(df["tcnformer_vdiff_pct"].mean()),
+        "tcnformer_within_99pct_power_rate": float(100.0 * (df["tcnformer_ratio_pct"] >= 99.0).mean()),
+        "tcnformer_within_98pct_power_rate": float(100.0 * (df["tcnformer_ratio_pct"] >= 98.0).mean()),
+        "tcnformer_within_95pct_power_rate": float(100.0 * (df["tcnformer_ratio_pct"] >= 95.0).mean()),
         "mean_final_ratio_pct": float(df["final_ratio_pct"].mean()),
         "median_final_ratio_pct": float(df["final_ratio_pct"].median()),
         "mean_final_power_regret_pct": float(df["final_power_regret_pct"].mean()),
@@ -1110,7 +1110,7 @@ def evaluate_ann_plus_po(curves, model, mu, sd, cfg: Config):
         "final_within_98pct_power_rate": float(100.0 * (df["final_ratio_pct"] >= 98.0).mean()),
         "final_within_95pct_power_rate": float(100.0 * (df["final_ratio_pct"] >= 95.0).mean()),
         "mean_zone_conf": float(df["zone_conf"].mean()),
-        "mean_ann_step_ratio": float(df["ann_step_ratio"].mean()),
+        "mean_tcnformer_step_ratio": float(df["tcnformer_step_ratio"].mean()),
     }
     return summary, df, examples
 
@@ -1171,7 +1171,7 @@ def visualize_examples_from_full_shaded_pool(examples: List[Dict[str, Any]], n_v
         ax.plot(v_plot, p_plot, label='Plot-ready P-V curve')
         ax.scatter(item['V_samples'], item['P_samples'], s=20, alpha=0.65, label='12 sample points')
         ax.scatter([oracle.vmpp_true], [oracle.pmpp_true], marker='*', s=160, label='True MPP', zorder=5)
-        ax.scatter([item['V_ann']], [item['P_ann']], marker='x', s=90, label='TCNformer stage', zorder=6)
+        ax.scatter([item['V_tcnformer']], [item['P_tcnformer']], marker='x', s=90, label='TCNformer stage', zorder=6)
         ax.scatter([item['V_final']], [item['P_final']], marker='D', s=70, label='TCNformer + local P&O', zorder=6)
         if item.get('po_trace'):
             po_v = [vp[0] for vp in item['po_trace']]
@@ -1179,7 +1179,7 @@ def visualize_examples_from_full_shaded_pool(examples: List[Dict[str, Any]], n_v
             ax.plot(po_v, po_p, linestyle='--', alpha=0.6, label='Local P&O trace')
         ax.set_title(
             f"Curve {item['curve_idx']} | peaks={item.get('plot_peak_count', 0)} | "
-            f"TCNformer={item['ann_ratio_pct']:.2f}% | Final={item['final_ratio_pct']:.2f}%"
+            f"TCNformer={item['tcnformer_ratio_pct']:.2f}% | Final={item['final_ratio_pct']:.2f}%"
         )
         ax.set_xlabel('Voltage (V)')
         ax.set_ylabel('Power (W)')
@@ -1223,31 +1223,31 @@ print("\nTraining PINN-guided Zone-and-Offset ANN...")
 model, mu, sd, history, sim_train_rows, sim_holdout_rows = train_model(sim_rows, cfg)
 
 print("\nQuantitative evaluation source: full unseen shaded-experimental set")
-ann_summary_exp_sh, ann_df_exp_sh = evaluate_ann_only([r['curve'] for r in exp_sh_rows], model, mu, sd, cfg)
-hybrid_summary_exp_sh, hybrid_df_exp_sh, exp_sh_examples = evaluate_ann_plus_po([r['curve'] for r in exp_sh_rows], model, mu, sd, cfg)
+tcnformer_summary_exp_sh, tcnformer_df_exp_sh = evaluate_tcnformer_only([r['curve'] for r in exp_sh_rows], model, mu, sd, cfg)
+hybrid_summary_exp_sh, hybrid_df_exp_sh, exp_sh_examples = evaluate_tcnformer_plus_po([r['curve'] for r in exp_sh_rows], model, mu, sd, cfg)
 
-ann_summary_sim_hold, ann_df_sim_hold = evaluate_ann_only([r['curve'] for r in sim_holdout_rows], model, mu, sd, cfg)
+tcnformer_summary_sim_hold, tcnformer_df_sim_hold = evaluate_tcnformer_only([r['curve'] for r in sim_holdout_rows], model, mu, sd, cfg)
 
-print("\n=== SIM HOLDOUT ANN-ONLY SUMMARY ===")
-for k, v in ann_summary_sim_hold.items():
+print("\n=== SIM HOLDOUT TCNformer-ONLY SUMMARY ===")
+for k, v in tcnformer_summary_sim_hold.items():
     print(f"{k}: {v}")
 
 print("\n=== EXP SHADED TCNformer-ONLY SUMMARY ===")
-for k, v in ann_summary_exp_sh.items():
+for k, v in tcnformer_summary_exp_sh.items():
     print(f"{k}: {v}")
 
-print("\n=== EXP SHADED ANN + LOCAL P&O SUMMARY ===")
+print("\n=== EXP SHADED TCNformer + LOCAL P&O SUMMARY ===")
 for k, v in hybrid_summary_exp_sh.items():
     print(f"{k}: {v}")
 
 print("\nUnseen shaded experimental TCNformer-only head:")
-display(ann_df_exp_sh.head(10))
+display(tcnformer_df_exp_sh.head(10))
 print("\nUnseen shaded experimental TCNformer + local P&O head:")
 display(hybrid_df_exp_sh.head(10))
 
 if REPORT_OK_EXPERIMENTAL_AUX and len(exp_ok_rows) > 0:
-    print("\n=== AUXILIARY OK EXPERIMENTAL ANN + LOCAL P&O SUMMARY ===")
-    ok_summary, ok_df, _ = evaluate_ann_plus_po([r['curve'] for r in exp_ok_rows], model, mu, sd, cfg)
+    print("\n=== AUXILIARY OK EXPERIMENTAL TCNformer + LOCAL P&O SUMMARY ===")
+    ok_summary, ok_df, _ = evaluate_tcnformer_plus_po([r['curve'] for r in exp_ok_rows], model, mu, sd, cfg)
     for k, v in ok_summary.items():
         print(f"{k}: {v}")
     display(ok_df.head(10))
@@ -1262,7 +1262,7 @@ if SAVE_MODEL_BUNDLE:
         "mu": mu,
         "sd": sd,
         "history": history,
-        "ann_summary_exp_sh": ann_summary_exp_sh,
+        "tcnformer_summary_exp_sh": tcnformer_summary_exp_sh,
         "hybrid_summary_exp_sh": hybrid_summary_exp_sh,
         "state_dict": model.state_dict(),
     }
