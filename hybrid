@@ -721,19 +721,19 @@ def pinn_zone_offset_loss(zone_probs, offset_pred, step_ratio_pred, batch, cfg: 
     seq_ihat = batch["seq_ihat"]
 
     pred_vhat, zone_probs, _, _ = compute_pred_vhat(zone_probs, offset_pred, zone_edges_t)
+    pred_vhat = pred_vhat.requires_grad_(True)
     zone_loss = nn.functional.nll_loss(torch.log(torch.clamp(zone_probs, min=1e-8)), y_zone)
     offset_loss = nn.functional.smooth_l1_loss(offset_pred, y_offset)
     step_loss = nn.functional.smooth_l1_loss(step_ratio_pred, y_step_ratio)
 
     i_pred = interp_batch_1d(pred_vhat, seq_vhat, seq_ihat)
-    dv = 1e-3
-    v_plus = torch.clamp(pred_vhat + dv, float(zone_edges_t[0]), float(zone_edges_t[-1]))
-    v_minus = torch.clamp(pred_vhat - dv, float(zone_edges_t[0]), float(zone_edges_t[-1]))
-    i_plus = interp_batch_1d(v_plus, seq_vhat, seq_ihat)
-    i_minus = interp_batch_1d(v_minus, seq_vhat, seq_ihat)
-    delta_i = i_plus - i_minus
-    delta_v = torch.clamp(v_plus - v_minus, min=1e-6)
-    physics_term = (delta_i / delta_v + i_pred / torch.clamp(pred_vhat, min=1e-6)) ** 2
+    dI_dV = torch.autograd.grad(
+        outputs=i_pred,
+        inputs=pred_vhat,
+        grad_outputs=torch.ones_like(i_pred),
+        create_graph=True,
+    )[0]
+    physics_term = (dI_dV + (i_pred / torch.clamp(pred_vhat, min=1e-6))) ** 2
     physics_loss = torch.mean(physics_term)
 
     data_loss = 1.0 * zone_loss + 0.5 * offset_loss + 0.5 * step_loss
@@ -759,10 +759,47 @@ def rows_to_arrays(rows: List[Dict[str, Any]]) -> Dict[str, np.ndarray]:
         "y_zone": np.asarray([r["y_zone"] for r in rows], dtype=np.int64),
         "y_offset": np.asarray([r["y_offset"] for r in rows], dtype=np.float32),
         "y_step_ratio": np.asarray([r["y_step_ratio"] for r in rows], dtype=np.float32),
+        "true_vhat": np.asarray([r["true_vhat"] for r in rows], dtype=np.float32),
         "seq_vhat": seq_vhat,
         "seq_ihat": seq_ihat,
     }
     return out
+
+
+def compute_transient_convergence_steps(
+    pred_vhat: torch.Tensor,
+    step_ratio_pred: torch.Tensor,
+    true_vhat: torch.Tensor,
+    cfg: Config,
+    tol_ratio: float = 0.01,
+    stable_window: int = 3,
+    max_steps: int = 64,
+) -> float:
+    pred = torch.clamp(pred_vhat.detach(), cfg.sample_fracs_min, cfg.sample_fracs_max)
+    truth = torch.clamp(true_vhat.detach(), cfg.sample_fracs_min, cfg.sample_fracs_max)
+    step = torch.clamp(step_ratio_pred.detach(), cfg.po_min_step_ratio, cfg.po_max_step_ratio)
+    max_steps = max(max_steps, stable_window + 1)
+
+    convergence_steps: List[float] = []
+    for p0, s, t in zip(pred, step, truth):
+        v_now = float(p0.item())
+        step_now = float(s.item())
+        target = float(t.item())
+        tol = max(tol_ratio * abs(target), 1e-6)
+        stable_count = 0
+        step_hit = float(max_steps)
+        for k in range(1, max_steps + 1):
+            direction = 1.0 if target > v_now else -1.0
+            v_now = float(np.clip(v_now + direction * step_now, cfg.sample_fracs_min, cfg.sample_fracs_max))
+            if abs(v_now - target) <= tol:
+                stable_count += 1
+            else:
+                stable_count = 0
+            if stable_count >= stable_window:
+                step_hit = float(k - stable_window + 1)
+                break
+        convergence_steps.append(step_hit)
+    return float(np.mean(convergence_steps)) if convergence_steps else float(max_steps)
 
 
 def fit_standardizer(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -812,6 +849,7 @@ def train_model(sim_rows: List[Dict[str, Any]], cfg: Config):
                 "y_zone": torch.tensor(tr["y_zone"][bi], dtype=torch.long, device=cfg.device),
                 "y_offset": torch.tensor(tr["y_offset"][bi], dtype=torch.float32, device=cfg.device),
                 "y_step_ratio": torch.tensor(tr["y_step_ratio"][bi], dtype=torch.float32, device=cfg.device),
+                "true_vhat": torch.tensor(tr["true_vhat"][bi], dtype=torch.float32, device=cfg.device),
                 "seq_vhat": torch.tensor(tr["seq_vhat"][bi], dtype=torch.float32, device=cfg.device),
                 "seq_ihat": torch.tensor(tr["seq_ihat"][bi], dtype=torch.float32, device=cfg.device),
             }
@@ -838,14 +876,15 @@ def train_model(sim_rows: List[Dict[str, Any]], cfg: Config):
             "y_zone": torch.tensor(va["y_zone"], dtype=torch.long, device=cfg.device),
             "y_offset": torch.tensor(va["y_offset"], dtype=torch.float32, device=cfg.device),
             "y_step_ratio": torch.tensor(va["y_step_ratio"], dtype=torch.float32, device=cfg.device),
+            "true_vhat": torch.tensor(va["true_vhat"], dtype=torch.float32, device=cfg.device),
             "seq_vhat": torch.tensor(va["seq_vhat"], dtype=torch.float32, device=cfg.device),
             "seq_ihat": torch.tensor(va["seq_ihat"], dtype=torch.float32, device=cfg.device),
         }
-        with torch.no_grad():
-            zone_probs, offset_pred, step_ratio_pred = model(vb["x_std"])
-            val_loss, val_parts = pinn_zone_offset_loss(zone_probs, offset_pred, step_ratio_pred, vb, cfg, zone_edges_t)
-            pred_vhat, zone_probs, _, _ = compute_pred_vhat(zone_probs, offset_pred, zone_edges_t)
-            zone_acc = float((torch.argmax(zone_probs, dim=1) == vb["y_zone"]).float().mean().detach().cpu() * 100.0)
+        zone_probs, offset_pred, step_ratio_pred = model(vb["x_std"])
+        val_loss, val_parts = pinn_zone_offset_loss(zone_probs, offset_pred, step_ratio_pred, vb, cfg, zone_edges_t)
+        pred_vhat, zone_probs, _, _ = compute_pred_vhat(zone_probs, offset_pred, zone_edges_t)
+        zone_acc = float((torch.argmax(zone_probs, dim=1) == vb["y_zone"]).float().mean().detach().cpu() * 100.0)
+        convergence_steps = compute_transient_convergence_steps(pred_vhat, step_ratio_pred, vb["true_vhat"], cfg)
         val_v_pct = float((torch.abs(pred_vhat - (0.5*(zone_edges_t[vb['y_zone']] + zone_edges_t[vb['y_zone']+1]) + 0.5*(zone_edges_t[vb['y_zone']+1]-zone_edges_t[vb['y_zone']])*vb['y_offset'])) / torch.clamp(torch.abs(0.5*(zone_edges_t[vb['y_zone']] + zone_edges_t[vb['y_zone']+1]) + 0.5*(zone_edges_t[vb['y_zone']+1]-zone_edges_t[vb['y_zone']])*vb['y_offset']), min=1e-6)).mean().detach().cpu() * 100.0)
         val_loss_f = float(val_loss.detach().cpu())
 
@@ -855,12 +894,14 @@ def train_model(sim_rows: List[Dict[str, Any]], cfg: Config):
             "val_loss": val_loss_f,
             "zone_acc": zone_acc,
             "val_v_pct": val_v_pct,
+            "convergence_steps": convergence_steps,
             **{f"train_{k}": v for k, v in train_parts_acc.items()},
             **{f"val_{k}": v for k, v in val_parts.items()},
         })
         print(
             f"Epoch {ep:03d} | train={avg_train_loss:.6f} | val={val_loss_f:.6f} | zone_acc={zone_acc:.2f}% | "
-            f"val_v_pct={val_v_pct:.3f}% | val_data={val_parts['data']:.4f} | val_physics={val_parts['physics']:.4f}"
+            f"val_v_pct={val_v_pct:.3f}% | val_data={val_parts['data']:.4f} | val_physics={val_parts['physics']:.4f} | "
+            f"convergence_steps={convergence_steps:.2f}"
         )
         if val_loss_f < best_val - cfg.early_stop_min_delta:
             best_val = val_loss_f
