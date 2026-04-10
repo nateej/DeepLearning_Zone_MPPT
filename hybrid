@@ -285,15 +285,7 @@ def clean_iv_curve_strict(v: np.ndarray, i: np.ndarray) -> Tuple[np.ndarray, np.
 
     mask = np.isfinite(v) & np.isfinite(i)
     v, i = v[mask], i[mask]
-    # Identify the physical Voc boundary where current drops to 0.
-    zero_crossings = np.where(i <= 0)[0]
-    if len(zero_crossings) > 0:
-        first_zero = int(zero_crossings[0])
-        # Truncate the arrays so the curve physically stops at Voc.
-        v = v[:first_zero + 1]
-        i = i[:first_zero + 1]
-
-    # Safety clip to ensure no negative micro-fluctuations exist prior to Voc.
+    # Basic non-negativity checks happen before physical truncation.
     v = np.clip(v, a_min=0.0, a_max=None)
     i = np.clip(i, a_min=0.0, a_max=None)
     if len(v) < 3:
@@ -312,6 +304,45 @@ def clean_iv_curve_strict(v: np.ndarray, i: np.ndarray) -> Tuple[np.ndarray, np.
 
     keep = v >= 0.0
     v, i = v[keep], i[keep]
+    if len(v) < 3:
+        return np.array([]), np.array([])
+
+    # Physical truncation in the core pipeline:
+    # keep only the positive-power generation segment, interpolate exact Voc,
+    # append (Voc, 0A), and discard any post-Voc tail/reverse-bias artefacts.
+    p = v * i
+    positive_indices = np.where(p > 0.0)[0]
+    if len(positive_indices) == 0:
+        return np.array([]), np.array([])
+
+    last_pos_idx = int(positive_indices[-1])
+    clean_v = list(v[:last_pos_idx + 1])
+    clean_i = list(i[:last_pos_idx + 1])
+
+    if last_pos_idx + 1 < len(v):
+        v1 = float(v[last_pos_idx])
+        i1 = float(i[last_pos_idx])
+        v2 = float(v[last_pos_idx + 1])
+        i2 = float(i[last_pos_idx + 1])
+        if abs(v2 - v1) > 1e-12:
+            slope = (i2 - i1) / (v2 - v1)
+            if abs(slope) > 1e-12:
+                voc_exact = v1 - (i1 / slope)
+            else:
+                voc_exact = v2
+        else:
+            voc_exact = v1
+        voc_exact = float(max(voc_exact, clean_v[-1]))
+        clean_v.append(voc_exact)
+        clean_i.append(0.0)
+    v = np.asarray(clean_v, dtype=float)
+    i = np.asarray(clean_i, dtype=float)
+    if len(v) < 3:
+        return np.array([]), np.array([])
+
+    # Final de-duplication after Voc insertion.
+    v, unique_idx = np.unique(v, return_index=True)
+    i = i[unique_idx]
     if len(v) < 3:
         return np.array([]), np.array([])
 
