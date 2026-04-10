@@ -1179,6 +1179,10 @@ def plot_training_histories(history: List[Dict[str, float]]):
 
 
 def visualize_examples_from_full_shaded_pool(examples: List[Dict[str, Any]], n_viz: int = 8):
+    title_font_size = 13
+    axis_label_font_size = 14
+    tick_font_size = 12
+    legend_font_size = 12
     chosen, mode = select_visualization_examples(examples, n_viz=n_viz)
     if len(chosen) == 0:
         print('No valid shaded-experimental visualization examples were found.')
@@ -1210,12 +1214,14 @@ def visualize_examples_from_full_shaded_pool(examples: List[Dict[str, Any]], n_v
             ax.plot(po_v, po_p, linestyle='--', alpha=0.6, label='Local P&O trace')
         ax.set_title(
             f"Curve {item['curve_idx']} | peaks={item.get('plot_peak_count', 0)} | "
-            f"TCNformer={item['tcnformer_ratio_pct']:.2f}% | Final={item['final_ratio_pct']:.2f}%"
+            f"TCNformer={item['tcnformer_ratio_pct']:.2f}% | Final={item['final_ratio_pct']:.2f}%",
+            fontsize=title_font_size,
         )
-        ax.set_xlabel('Voltage (V)')
-        ax.set_ylabel('Power (W)')
+        ax.set_xlabel('Voltage (V)', fontsize=axis_label_font_size)
+        ax.set_ylabel('Power (W)', fontsize=axis_label_font_size)
+        ax.tick_params(axis='both', labelsize=tick_font_size)
         ax.grid(True, alpha=0.3)
-    axes[0].legend(loc='best')
+    axes[0].legend(loc='best', fontsize=legend_font_size)
     plt.tight_layout()
     plt.show()
 
