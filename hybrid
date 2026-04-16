@@ -292,16 +292,24 @@ def enforce_physical_iv_endpoints(
     idx = np.argsort(v)
     v, i = v[idx], i[idx]
 
+    low_n = min(3, len(i))
+    isc_ref = float(max(np.max(i[:low_n]), 0.0))
+
     if v[0] > tol:
-        low_n = min(3, len(i))
-        isc_est = float(np.max(i[:low_n]))
         v = np.concatenate(([0.0], v))
-        i = np.concatenate(([max(isc_est, 0.0)], i))
+        i = np.concatenate(([isc_ref], i))
         if diag is not None:
             diag["left_endpoint_inserted"] = int(diag.get("left_endpoint_inserted", 0)) + 1
     else:
         v[0] = 0.0
-        i[0] = max(float(i[0]), 0.0)
+        i0 = max(float(i[0]), 0.0)
+        repair_threshold = max(1e-9, 0.2 * isc_ref)
+        if isc_ref > 0.0 and i0 <= repair_threshold:
+            i[0] = isc_ref
+            if diag is not None:
+                diag["left_endpoint_repaired"] = int(diag.get("left_endpoint_repaired", 0)) + 1
+        else:
+            i[0] = i0
 
     voc_target = float(voc_est) if voc_est is not None else float(v[-1])
     voc_target = max(voc_target, float(v[-1]))
@@ -430,6 +438,7 @@ def clean_iv_curve_strict(v: np.ndarray, i: np.ndarray, diag: Optional[Dict[str,
 
     # internal sanity checks (lightweight)
     assert abs(float(v_clean[0])) <= 1e-6, "cleaned I-V must start at 0 V"
+    assert float(i_clean[0]) > 1e-9, "cleaned I-V first current must be positive for valid curves"
     assert abs(float(i_clean[-1])) <= 1e-6, "cleaned I-V must end at 0 A at Voc"
     assert float(v_clean[-1]) > float(v_clean[-2]), "cleaned I-V cannot have zero tail duplicates at Voc"
     return v_clean.astype(np.float32), i_clean.astype(np.float32)
@@ -695,6 +704,7 @@ def build_dataset_from_curves(curves, cfg: Config):
         "skipped_validate": 0,
         "sign_flip": 0,
         "left_endpoint_inserted": 0,
+        "left_endpoint_repaired": 0,
         "voc_endpoint_inserted": 0,
         "rejected": 0,
     }
@@ -723,6 +733,7 @@ def build_dataset_from_curves(curves, cfg: Config):
         {
             "sign_flip": stats["sign_flip"],
             "left_endpoint_inserted": stats["left_endpoint_inserted"],
+            "left_endpoint_repaired": stats["left_endpoint_repaired"],
             "voc_endpoint_inserted": stats["voc_endpoint_inserted"],
             "rejected": stats["rejected"],
         },
