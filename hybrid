@@ -273,94 +273,188 @@ def load_dataset(path: str):
     raise ValueError("Dataset must be .npz or .mat")
 
 # =========================================================
-# CLEANING / VALIDATION (STRICT: no synthetic endpoints)
+# CLEANING / VALIDATION (STRICT + PHYSICALLY CONSISTENT)
 # =========================================================
-def clean_iv_curve_strict(v: np.ndarray, i: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def enforce_physical_iv_endpoints(
+    v: np.ndarray,
+    i: np.ndarray,
+    voc_est: Optional[float] = None,
+    diag: Optional[Dict[str, int]] = None,
+    tol: float = 1e-9,
+) -> Tuple[np.ndarray, np.ndarray]:
     if v is None or i is None:
         return np.array([]), np.array([])
     v = np.asarray(v, dtype=float).ravel()
     i = np.asarray(i, dtype=float).ravel()
-    if len(v) != len(i) or len(v) < 3:
-        return np.array([]), np.array([])
-
-    mask = np.isfinite(v) & np.isfinite(i)
-    v, i = v[mask], i[mask]
-    # Basic non-negativity checks happen before physical truncation.
-    v = np.clip(v, a_min=0.0, a_max=None)
-    i = np.clip(i, a_min=0.0, a_max=None)
-    if len(v) < 3:
+    if len(v) != len(i) or len(v) < 2:
         return np.array([]), np.array([])
 
     idx = np.argsort(v)
     v, i = v[idx], i[idx]
 
+    if v[0] > tol:
+        low_n = min(3, len(i))
+        isc_est = float(np.max(i[:low_n]))
+        v = np.concatenate(([0.0], v))
+        i = np.concatenate(([max(isc_est, 0.0)], i))
+        if diag is not None:
+            diag["left_endpoint_inserted"] = int(diag.get("left_endpoint_inserted", 0)) + 1
+    else:
+        v[0] = 0.0
+        i[0] = max(float(i[0]), 0.0)
+
+    voc_target = float(voc_est) if voc_est is not None else float(v[-1])
+    voc_target = max(voc_target, float(v[-1]))
+    pre_v = v[v < (voc_target - tol)]
+    pre_i = i[v < (voc_target - tol)]
+    if len(pre_v) < 2:
+        return np.array([]), np.array([])
+
+    needs_voc_append = not (abs(float(v[-1]) - voc_target) <= tol and abs(float(i[-1])) <= tol)
+    v = np.concatenate([pre_v, [voc_target]])
+    i = np.concatenate([np.clip(pre_i, 0.0, None), [0.0]])
+    if needs_voc_append and diag is not None:
+        diag["voc_endpoint_inserted"] = int(diag.get("voc_endpoint_inserted", 0)) + 1
+
     v, unique_idx = np.unique(v, return_index=True)
     i = i[unique_idx]
     if len(v) < 3:
         return np.array([]), np.array([])
-
-    if np.nanmean(i) < 0:
-        i = -i
-
-    keep = v >= 0.0
-    v, i = v[keep], i[keep]
-    if len(v) < 3:
+    if not np.all(np.diff(v) > 0):
         return np.array([]), np.array([])
-
-    # Physical truncation in the core pipeline:
-    # keep only the positive-power generation segment, interpolate exact Voc,
-    # append (Voc, 0A), and discard any post-Voc tail/reverse-bias artefacts.
-    p = v * i
-    positive_indices = np.where(p > 0.0)[0]
-    if len(positive_indices) == 0:
-        return np.array([]), np.array([])
-
-    last_pos_idx = int(positive_indices[-1])
-    clean_v = list(v[:last_pos_idx + 1])
-    clean_i = list(i[:last_pos_idx + 1])
-
-    if last_pos_idx + 1 < len(v):
-        v1 = float(v[last_pos_idx])
-        i1 = float(i[last_pos_idx])
-        v2 = float(v[last_pos_idx + 1])
-        i2 = float(i[last_pos_idx + 1])
-        if abs(v2 - v1) > 1e-12:
-            slope = (i2 - i1) / (v2 - v1)
-            if abs(slope) > 1e-12:
-                voc_exact = v1 - (i1 / slope)
-            else:
-                voc_exact = v2
-        else:
-            voc_exact = v1
-        voc_exact = float(max(voc_exact, clean_v[-1]))
-        clean_v.append(voc_exact)
-        clean_i.append(0.0)
-    v = np.asarray(clean_v, dtype=float)
-    i = np.asarray(clean_i, dtype=float)
-    if len(v) < 3:
-        return np.array([]), np.array([])
-
-    # Final de-duplication after Voc insertion.
-    v, unique_idx = np.unique(v, return_index=True)
-    i = i[unique_idx]
-    if len(v) < 3:
-        return np.array([]), np.array([])
-
     return v.astype(np.float32), i.astype(np.float32)
 
 
-def validate_cleaned_curve(v: np.ndarray, i: np.ndarray) -> bool:
-    if len(v) < 8 or len(i) < 8:
-        return False
+def resample_iv_curve(v: np.ndarray, i: np.ndarray, n_points: int) -> Tuple[np.ndarray, np.ndarray]:
+    v = np.asarray(v, dtype=float).ravel()
+    i = np.asarray(i, dtype=float).ravel()
+    if len(v) != len(i) or len(v) < 2 or n_points < 2:
+        return np.array([]), np.array([])
+    voc = float(v[-1])
+    if voc <= 0.0:
+        return np.array([]), np.array([])
+    v_grid = np.linspace(0.0, voc, int(n_points), dtype=float)
+    i_grid = np.interp(v_grid, v, i)
+    i_grid = np.clip(i_grid, 0.0, None)
+    i_grid[-1] = 0.0
+    return v_grid.astype(np.float32), i_grid.astype(np.float32)
+
+
+def build_pv_curve_from_iv(v: np.ndarray, i: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    # Physics note:
+    # - I-V starts near (0, Isc) and ends at (Voc, 0)
+    # - P-V derived from I-V starts at (0, 0) and ends at (Voc, 0)
+    v = np.asarray(v, dtype=float).ravel()
+    i = np.asarray(i, dtype=float).ravel()
+    if len(v) != len(i) or len(v) < 2:
+        return np.array([]), np.array([])
+    p = np.clip(v * i, 0.0, None)
+    p[0] = 0.0
+    p[-1] = 0.0
+    return v.astype(np.float32), p.astype(np.float32)
+
+
+def clean_iv_curve_strict(v: np.ndarray, i: np.ndarray, diag: Optional[Dict[str, int]] = None) -> Tuple[np.ndarray, np.ndarray]:
+    if v is None or i is None:
+        return np.array([]), np.array([])
+
+    # (a) convert to 1D float arrays
+    v = np.asarray(v, dtype=float).ravel()
+    i = np.asarray(i, dtype=float).ravel()
+    # (c) reject mismatched length / short curves
+    if len(v) != len(i) or len(v) < 3:
+        return np.array([]), np.array([])
+
+    # (b) remove NaN/Inf
+    mask = np.isfinite(v) & np.isfinite(i)
+    v, i = v[mask], i[mask]
+    if len(v) < 3:
+        return np.array([]), np.array([])
+
+    # (d) if dataset current sign is inverted, flip once
+    if float(np.nanmedian(i)) < 0.0:
+        i = -i
+        if diag is not None:
+            diag["sign_flip"] = int(diag.get("sign_flip", 0)) + 1
+
+    # (e) clip to physical quadrant
+    keep_quad = (v >= 0.0) & (i >= 0.0)
+    v, i = v[keep_quad], i[keep_quad]
+    if len(v) < 3:
+        return np.array([]), np.array([])
+
+    # (f) sort by voltage ascending
+    idx = np.argsort(v)
+    v, i = v[idx], i[idx]
+
+    # (g) remove duplicate voltages (keep highest current at same voltage)
+    uv, first_idx = np.unique(v, return_index=True)
+    i_max = np.maximum.reduceat(i, first_idx)
+    v, i = uv, i_max
+    if len(v) < 3:
+        return np.array([]), np.array([])
+
+    # (h) keep generating region and remove post-generation/reverse-bias tail
+    p = v * i
+    valid = (i > 1e-9) & (p > 1e-12)
+    if not np.any(valid):
+        return np.array([]), np.array([])
+    last_pos_idx = int(np.where(valid)[0][-1])
+    v_gen = v[: last_pos_idx + 1]
+    i_gen = i[: last_pos_idx + 1]
+    if len(v_gen) < 2:
+        return np.array([]), np.array([])
+
+    # (i) estimate exact Voc near the final descending segment
+    if last_pos_idx + 1 < len(v):
+        v1, i1 = float(v[last_pos_idx]), float(i[last_pos_idx])
+        v2, i2 = float(v[last_pos_idx + 1]), float(i[last_pos_idx + 1])
+    else:
+        v1, i1 = float(v_gen[-2]), float(i_gen[-2])
+        v2, i2 = float(v_gen[-1]), float(i_gen[-1])
+    denom = (v2 - v1)
+    if abs(denom) > 1e-12:
+        slope = (i2 - i1) / denom
+        if abs(slope) > 1e-12:
+            voc_est = v1 - i1 / slope
+        else:
+            voc_est = v_gen[-1]
+    else:
+        voc_est = v_gen[-1]
+    voc_est = float(max(voc_est, v_gen[-1]))
+
+    # (j,k) enforce physical endpoints and ensure no post-Voc tail
+    v_clean, i_clean = enforce_physical_iv_endpoints(v_gen, i_gen, voc_est=voc_est, diag=diag, tol=1e-9)
+    if len(v_clean) < 3:
+        return np.array([]), np.array([])
+
+    # internal sanity checks (lightweight)
+    assert abs(float(v_clean[0])) <= 1e-6, "cleaned I-V must start at 0 V"
+    assert abs(float(i_clean[-1])) <= 1e-6, "cleaned I-V must end at 0 A at Voc"
+    assert float(v_clean[-1]) > float(v_clean[-2]), "cleaned I-V cannot have zero tail duplicates at Voc"
+    return v_clean.astype(np.float32), i_clean.astype(np.float32)
+
+
+def validate_cleaned_curve(v: np.ndarray, i: np.ndarray, tol: float = 1e-6) -> bool:
+    v = np.asarray(v, dtype=float).ravel()
+    i = np.asarray(i, dtype=float).ravel()
     if len(v) != len(i):
+        return False
+    if len(v) < 8:
         return False
     if not np.all(np.isfinite(v)) or not np.all(np.isfinite(i)):
         return False
-    if not np.all(np.diff(v) > 0):
+    if not np.all(np.diff(v) > tol):
         return False
-    if float(np.max(v)) <= 0:
+    if abs(float(v[0])) > tol:
         return False
-    if float(np.max(v * i)) <= 0:
+    if abs(float(i[-1])) > tol:
+        return False
+    if np.any(i < -tol):
+        return False
+    if float(np.max(v)) <= tol:
+        return False
+    if float(np.max(v * i)) <= tol:
         return False
     return True
 
@@ -380,45 +474,14 @@ def compute_mpp_dense(v: np.ndarray, i: np.ndarray, n: int = 2000) -> Tuple[floa
 
 
 def prepare_pv_plot_curve(v: np.ndarray, i: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Prepare a visualization-only P-V curve.
-    This does NOT affect ANN training/evaluation. It only makes the plotted P-V trace
-    start at (0,0), stay nonnegative, and end at (Voc,0).
-    """
-    if v is None or i is None:
+    """Prepare visualization-only P-V from cleaned I-V (never from raw ad hoc logic)."""
+    pv_v, pv_p = build_pv_curve_from_iv(v, i)
+    if len(pv_v) < 2:
         return np.array([]), np.array([])
-    v = np.asarray(v, dtype=float).ravel()
-    i = np.asarray(i, dtype=float).ravel()
-    if len(v) != len(i) or len(v) < 2:
-        return np.array([]), np.array([])
-    mask = np.isfinite(v) & np.isfinite(i)
-    v, i = v[mask], i[mask]
-    if len(v) < 2:
-        return np.array([]), np.array([])
-    idx = np.argsort(v)
-    v, i = v[idx], i[idx]
-    v, unique_idx = np.unique(v, return_index=True)
-    i = i[unique_idx]
-    if len(v) < 2:
-        return np.array([]), np.array([])
-    if np.nanmean(i) < 0:
-        i = -i
-    keep = v >= 0.0
-    v, i = v[keep], i[keep]
-    if len(v) < 2:
-        return np.array([]), np.array([])
-    # For plotting only: power cannot be negative.
-    p = np.clip(v * i, 0.0, None)
-    p0 = 0.0
-    pv = v.copy()
-    pp = p.copy()
-    if pv[0] > 1e-9:
-        pv = np.concatenate(([0.0], pv))
-        pp = np.concatenate(([p0], pp))
-    else:
-        pp[0] = 0.0
-        pv[0] = 0.0
-    pp[-1] = 0.0
-    return pv.astype(np.float32), pp.astype(np.float32)
+    # internal sanity checks for derived P-V
+    assert abs(float(pv_p[0])) <= 1e-6, "derived P-V must start at 0 W"
+    assert abs(float(pv_p[-1])) <= 1e-6, "derived P-V must end at 0 W"
+    return pv_v, pv_p
 
 
 def dense_peak_profile_for_plot(oracle, n_dense: int = 2000, rel_thresh: float = 0.01, min_index_gap: int = 20) -> Dict[str, Any]:
@@ -624,24 +687,46 @@ def build_feature_vector(v: np.ndarray, i: np.ndarray, sample_fracs: np.ndarray,
 
 def build_dataset_from_curves(curves, cfg: Config):
     rows: List[Dict[str, Any]] = []
-    stats = {"total": 0, "valid": 0, "skipped_extract": 0, "skipped_clean": 0, "skipped_validate": 0}
+    stats = {
+        "total": 0,
+        "valid": 0,
+        "skipped_extract": 0,
+        "skipped_clean": 0,
+        "skipped_validate": 0,
+        "sign_flip": 0,
+        "left_endpoint_inserted": 0,
+        "voc_endpoint_inserted": 0,
+        "rejected": 0,
+    }
     for item in iter_curve_items(curves):
         stats["total"] += 1
         v_raw, i_raw = extract_vi(item)
         if v_raw is None or i_raw is None:
             stats["skipped_extract"] += 1
+            stats["rejected"] += 1
             continue
-        v, i = clean_iv_curve_strict(v_raw, i_raw)
+        v, i = clean_iv_curve_strict(v_raw, i_raw, diag=stats)
         if len(v) < 8:
             stats["skipped_clean"] += 1
+            stats["rejected"] += 1
             continue
         if not validate_cleaned_curve(v, i):
             stats["skipped_validate"] += 1
+            stats["rejected"] += 1
             continue
         feat = build_feature_vector(v, i, cfg.sample_fracs, cfg)
         feat["curve"] = item
         rows.append(feat)
         stats["valid"] += 1
+    print(
+        "Preprocess summary:",
+        {
+            "sign_flip": stats["sign_flip"],
+            "left_endpoint_inserted": stats["left_endpoint_inserted"],
+            "voc_endpoint_inserted": stats["voc_endpoint_inserted"],
+            "rejected": stats["rejected"],
+        },
+    )
     return rows, stats
 
 # =========================================================
