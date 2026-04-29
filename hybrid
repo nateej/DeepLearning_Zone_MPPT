@@ -481,6 +481,8 @@ def validate_cleaned_curve(v: np.ndarray, i: np.ndarray, tol: float = 1e-6) -> b
         return False
     if not np.isclose(float(i[-1]), 0.0, atol=tol):
         return False
+    if float(i[0]) <= tol:
+        return False
     if np.any(i < -tol):
         return False
     if float(np.max(v)) <= tol:
