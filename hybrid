@@ -555,6 +555,52 @@ def dense_peak_profile_for_plot(oracle, n_dense: int = 2000, rel_thresh: float =
         "p_dense": p_dense.astype(np.float32),
     }
 
+
+def count_local_maxima_dense(p_arr: np.ndarray, rel_thresh: float = 0.01, min_index_gap: int = 20) -> Tuple[int, List[int]]:
+    p = np.asarray(p_arr, dtype=float).ravel()
+    if len(p) < 5:
+        return 0, []
+    vmax = max(float(np.max(p)), 1e-12)
+    thresh = rel_thresh * vmax
+    peaks: List[int] = []
+    for k in range(1, len(p) - 1):
+        if p[k] >= p[k - 1] and p[k] >= p[k + 1] and p[k] >= thresh:
+            peaks.append(k)
+    if len(peaks) <= 1:
+        return len(peaks), peaks
+    merged = [peaks[0]]
+    for idx in peaks[1:]:
+        if idx - merged[-1] < min_index_gap:
+            if p[idx] > p[merged[-1]]:
+                merged[-1] = idx
+        else:
+            merged.append(idx)
+    return len(merged), merged
+
+
+def dense_peak_profile(v: np.ndarray, i: np.ndarray, cfg: Config) -> Dict[str, Any]:
+    vmpp, pmpp, v_dense, p_dense = compute_mpp_dense(v, i)
+    if len(v_dense) == 0:
+        return {"vmpp": 0.0, "pmpp": 0.0, "n_peaks": 0, "peak_idxs": [], "peak_prominence_score": 0.0,
+                "v_dense": np.array([]), "p_dense": np.array([])}
+    n_peaks, peak_idxs = count_local_maxima_dense(
+        p_dense, rel_thresh=cfg.plot_peak_rel_thresh, min_index_gap=cfg.plot_peak_min_gap
+    )
+    if n_peaks < 2:
+        prom_score = 0.0
+    else:
+        peak_vals = sorted([float(p_dense[k]) for k in peak_idxs], reverse=True)
+        prom_score = float(peak_vals[1] / max(peak_vals[0], 1e-12))
+    return {
+        "vmpp": vmpp,
+        "pmpp": pmpp,
+        "n_peaks": int(n_peaks),
+        "peak_idxs": list(peak_idxs),
+        "peak_prominence_score": prom_score,
+        "v_dense": v_dense,
+        "p_dense": p_dense,
+    }
+
 # =========================================================
 # CURVE ORACLE + FEATURES
 # =========================================================
