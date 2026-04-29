@@ -275,189 +275,211 @@ def load_dataset(path: str):
 # =========================================================
 # CLEANING / VALIDATION (STRICT + PHYSICALLY CONSISTENT)
 # =========================================================
-def enforce_physical_iv_endpoints(
-    v: np.ndarray,
-    i: np.ndarray,
-    voc_est: Optional[float] = None,
-    diag: Optional[Dict[str, int]] = None,
-    tol: float = 1e-9,
-) -> Tuple[np.ndarray, np.ndarray]:
-    if v is None or i is None:
-        return np.array([]), np.array([])
-    v = np.asarray(v, dtype=float).ravel()
-    i = np.asarray(i, dtype=float).ravel()
+def merge_near_duplicate_voltage(v: np.ndarray, i: np.ndarray, rel_tol: float = 1e-7, abs_tol: float = 1e-6) -> Tuple[np.ndarray, np.ndarray]:
+    """Merge near-duplicate voltage samples instead of rejecting dense clean curves.
+
+    Reason: experimental dense PV sweeps can have dV around 1e-8, which is valid and
+    should be merged for robust downstream validation.
+    """
+    v = np.asarray(v, dtype=np.float64).ravel()
+    i = np.asarray(i, dtype=np.float64).ravel()
+    if len(v) != len(i) or len(v) == 0:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+    idx = np.argsort(v)
+    v = v[idx]
+    i = i[idx]
+    voc = float(np.max(v)) if len(v) else 0.0
+    group_tol = max(float(abs_tol), float(rel_tol) * max(voc, 0.0))
+
+    out_v, out_i = [], []
+    g_v, g_i = [float(v[0])], [float(i[0])]
+    for k in range(1, len(v)):
+        if float(v[k] - g_v[-1]) <= group_tol:
+            g_v.append(float(v[k]))
+            g_i.append(float(i[k]))
+        else:
+            out_v.append(float(np.mean(g_v)))
+            out_i.append(float(np.median(g_i)))
+            g_v, g_i = [float(v[k])], [float(i[k])]
+    out_v.append(float(np.mean(g_v)))
+    out_i.append(float(np.median(g_i)))
+    return np.asarray(out_v, dtype=np.float64), np.asarray(out_i, dtype=np.float64)
+
+
+def estimate_isc_from_low_voltage_window(v: np.ndarray, i: np.ndarray, low_frac: float = 0.08) -> float:
+    """Estimate Isc from low-voltage window, not only first few samples.
+
+    Reason: first points can be noisy/collapsed and can cause inward low-voltage P-V truncation.
+    """
+    v = np.asarray(v, dtype=np.float64).ravel()
+    i = np.asarray(i, dtype=np.float64).ravel()
+    if len(v) != len(i) or len(v) == 0:
+        return 0.0
+    finite_pos = np.isfinite(i) & (i > 0.0)
+    if not np.any(finite_pos):
+        return 0.0
+    voc = float(np.max(v)) if len(v) else 0.0
+    low_mask = finite_pos & np.isfinite(v) & (v <= low_frac * max(voc, 0.0))
+    if int(np.sum(low_mask)) >= 5:
+        return float(np.percentile(i[low_mask], 85))
+    return float(np.percentile(i[finite_pos], 85))
+
+
+def enforce_physical_iv_endpoints(v: np.ndarray, i: np.ndarray, voc_est: Optional[float] = None, diag: Optional[Dict[str, int]] = None, tol: float = 1e-9) -> Tuple[np.ndarray, np.ndarray]:
+    v = np.asarray(v, dtype=np.float64).ravel()
+    i = np.asarray(i, dtype=np.float64).ravel()
     if len(v) != len(i) or len(v) < 2:
+        return np.array([]), np.array([])
+
+    good = np.isfinite(v) & np.isfinite(i)
+    v, i = v[good], i[good]
+    if len(v) < 2:
         return np.array([]), np.array([])
 
     idx = np.argsort(v)
     v, i = v[idx], i[idx]
+    v, i = merge_near_duplicate_voltage(v, i)
+    if len(v) < 2:
+        return np.array([]), np.array([])
 
-    low_n = min(3, len(i))
-    isc_ref = float(max(np.max(i[:low_n]), 0.0))
+    voc_ref = float(max(np.max(v), float(voc_est) if voc_est is not None else np.max(v)))
+    isc_est = max(estimate_isc_from_low_voltage_window(v, i), 0.0)
 
-    if v[0] > tol:
+    low_region = v <= (0.15 * max(voc_ref, 0.0))
+    bad_low_current = low_region & (i < 0.35 * isc_est)
+    removed = int(np.sum(bad_low_current))
+    if removed > 0:
+        v, i = v[~bad_low_current], i[~bad_low_current]
+    if diag is not None:
+        diag['low_voltage_artifact_removed'] = int(diag.get('low_voltage_artifact_removed', 0)) + removed
+    if len(v) < 2:
+        return np.array([]), np.array([])
+
+    if abs(float(v[0])) > tol:
         v = np.concatenate(([0.0], v))
-        i = np.concatenate(([isc_ref], i))
+        i = np.concatenate(([isc_est], i))
         if diag is not None:
-            diag["left_endpoint_inserted"] = int(diag.get("left_endpoint_inserted", 0)) + 1
+            diag['left_endpoint_inserted'] = int(diag.get('left_endpoint_inserted', 0)) + 1
     else:
         v[0] = 0.0
-        i0 = max(float(i[0]), 0.0)
-        repair_threshold = max(1e-9, 0.2 * isc_ref)
-        if isc_ref > 0.0 and i0 <= repair_threshold:
-            i[0] = isc_ref
+        if float(i[0]) < isc_est:
+            i[0] = isc_est
             if diag is not None:
-                diag["left_endpoint_repaired"] = int(diag.get("left_endpoint_repaired", 0)) + 1
-        else:
-            i[0] = i0
+                diag['left_endpoint_repaired'] = int(diag.get('left_endpoint_repaired', 0)) + 1
 
-    voc_target = float(voc_est) if voc_est is not None else float(v[-1])
-    voc_target = max(voc_target, float(v[-1]))
-    pre_v = v[v < (voc_target - tol)]
-    pre_i = i[v < (voc_target - tol)]
-    if len(pre_v) < 2:
+    voc_target = max(voc_ref, float(v[-1]))
+    if not (abs(float(v[-1]) - voc_target) <= tol and abs(float(i[-1])) <= tol):
+        if diag is not None:
+            diag['voc_endpoint_inserted'] = int(diag.get('voc_endpoint_inserted', 0)) + 1
+    pre = v < (voc_target - tol)
+    v = np.concatenate([v[pre], [voc_target]])
+    i = np.concatenate([np.clip(i[pre], 0.0, None), [0.0]])
+
+    v, i = merge_near_duplicate_voltage(v, i)
+    if len(v) < 8:
         return np.array([]), np.array([])
-
-    needs_voc_append = not (abs(float(v[-1]) - voc_target) <= tol and abs(float(i[-1])) <= tol)
-    v = np.concatenate([pre_v, [voc_target]])
-    i = np.concatenate([np.clip(pre_i, 0.0, None), [0.0]])
-    if needs_voc_append and diag is not None:
-        diag["voc_endpoint_inserted"] = int(diag.get("voc_endpoint_inserted", 0)) + 1
-
-    v, unique_idx = np.unique(v, return_index=True)
-    i = i[unique_idx]
-    if len(v) < 3:
+    v[0] = 0.0
+    i[0] = max(float(i[0]), isc_est)
+    i[-1] = 0.0
+    if np.any(np.diff(v) <= 0.0):
         return np.array([]), np.array([])
-    if not np.all(np.diff(v) > 0):
-        return np.array([]), np.array([])
-    return v.astype(np.float32), i.astype(np.float32)
+    return v.astype(np.float64), np.clip(i, 0.0, None).astype(np.float64)
 
 
-def resample_iv_curve(v: np.ndarray, i: np.ndarray, n_points: int) -> Tuple[np.ndarray, np.ndarray]:
-    v = np.asarray(v, dtype=float).ravel()
-    i = np.asarray(i, dtype=float).ravel()
-    if len(v) != len(i) or len(v) < 2 or n_points < 2:
+def resample_iv_curve(v: np.ndarray, i: np.ndarray, n_points: int = 2000) -> Tuple[np.ndarray, np.ndarray]:
+    v = np.asarray(v, dtype=np.float64).ravel()
+    i = np.asarray(i, dtype=np.float64).ravel()
+    if len(v) != len(i) or len(v) < 2 or int(n_points) < 2:
         return np.array([]), np.array([])
-    voc = float(v[-1])
+    voc = float(np.max(v))
     if voc <= 0.0:
         return np.array([]), np.array([])
-    v_grid = np.linspace(0.0, voc, int(n_points), dtype=float)
+    v_grid = np.linspace(0.0, voc, int(n_points), dtype=np.float64)
     i_grid = np.interp(v_grid, v, i)
     i_grid = np.clip(i_grid, 0.0, None)
+    i_grid[0] = max(float(i_grid[0]), estimate_isc_from_low_voltage_window(v, i))
     i_grid[-1] = 0.0
-    return v_grid.astype(np.float32), i_grid.astype(np.float32)
+    return v_grid.astype(np.float64), i_grid.astype(np.float64)
 
 
 def build_pv_curve_from_iv(v: np.ndarray, i: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    # Physics note:
-    # - I-V starts near (0, Isc) and ends at (Voc, 0)
-    # - P-V derived from I-V starts at (0, 0) and ends at (Voc, 0)
-    v = np.asarray(v, dtype=float).ravel()
-    i = np.asarray(i, dtype=float).ravel()
-    if len(v) != len(i) or len(v) < 2:
+    v_grid, i_grid = resample_iv_curve(v, i, n_points=2000)
+    if len(v_grid) < 2:
         return np.array([]), np.array([])
-    p = np.clip(v * i, 0.0, None)
-    p[0] = 0.0
-    p[-1] = 0.0
-    return v.astype(np.float32), p.astype(np.float32)
+    p_grid = np.clip(v_grid * i_grid, 0.0, None)
+    p_grid[0] = 0.0
+    p_grid[-1] = 0.0
+    return v_grid.astype(np.float64), p_grid.astype(np.float64)
 
 
 def clean_iv_curve_strict(v: np.ndarray, i: np.ndarray, diag: Optional[Dict[str, int]] = None) -> Tuple[np.ndarray, np.ndarray]:
-    if v is None or i is None:
-        return np.array([]), np.array([])
-
-    # (a) convert to 1D float arrays
-    v = np.asarray(v, dtype=float).ravel()
-    i = np.asarray(i, dtype=float).ravel()
-    # (c) reject mismatched length / short curves
+    v = np.asarray(v, dtype=np.float64).ravel()
+    i = np.asarray(i, dtype=np.float64).ravel()
     if len(v) != len(i) or len(v) < 3:
         return np.array([]), np.array([])
 
-    # (b) remove NaN/Inf
-    mask = np.isfinite(v) & np.isfinite(i)
-    v, i = v[mask], i[mask]
+    good = np.isfinite(v) & np.isfinite(i)
+    v, i = v[good], i[good]
     if len(v) < 3:
         return np.array([]), np.array([])
 
-    # (d) if dataset current sign is inverted, flip once
     if float(np.nanmedian(i)) < 0.0:
         i = -i
         if diag is not None:
-            diag["sign_flip"] = int(diag.get("sign_flip", 0)) + 1
+            diag['sign_flip'] = int(diag.get('sign_flip', 0)) + 1
 
-    # (e) clip to physical quadrant
-    keep_quad = (v >= 0.0) & (i >= 0.0)
-    v, i = v[keep_quad], i[keep_quad]
+    quad = (v >= 0.0) & (i >= 0.0)
+    v, i = v[quad], i[quad]
     if len(v) < 3:
         return np.array([]), np.array([])
 
-    # (f) sort by voltage ascending
     idx = np.argsort(v)
     v, i = v[idx], i[idx]
-
-    # (g) remove duplicate voltages (keep highest current at same voltage)
-    uv, first_idx = np.unique(v, return_index=True)
-    i_max = np.maximum.reduceat(i, first_idx)
-    v, i = uv, i_max
+    v, i = merge_near_duplicate_voltage(v, i)
     if len(v) < 3:
         return np.array([]), np.array([])
 
-    # (h) keep generating region and remove post-generation/reverse-bias tail
     p = v * i
     valid = (i > 1e-9) & (p > 1e-12)
     if not np.any(valid):
         return np.array([]), np.array([])
     last_pos_idx = int(np.where(valid)[0][-1])
-    v_gen = v[: last_pos_idx + 1]
-    i_gen = i[: last_pos_idx + 1]
-    if len(v_gen) < 2:
-        return np.array([]), np.array([])
 
-    # (i) estimate exact Voc near the final descending segment
     if last_pos_idx + 1 < len(v):
         v1, i1 = float(v[last_pos_idx]), float(i[last_pos_idx])
         v2, i2 = float(v[last_pos_idx + 1]), float(i[last_pos_idx + 1])
+    elif len(v) >= 2:
+        v1, i1 = float(v[-2]), float(v[-2]*0 + i[-2])
+        v2, i2 = float(v[-1]), float(i[-1])
     else:
-        v1, i1 = float(v_gen[-2]), float(i_gen[-2])
-        v2, i2 = float(v_gen[-1]), float(i_gen[-1])
+        return np.array([]), np.array([])
     denom = (v2 - v1)
+    voc_est = float(v[last_pos_idx])
     if abs(denom) > 1e-12:
         slope = (i2 - i1) / denom
         if abs(slope) > 1e-12:
-            voc_est = v1 - i1 / slope
-        else:
-            voc_est = v_gen[-1]
-    else:
-        voc_est = v_gen[-1]
-    voc_est = float(max(voc_est, v_gen[-1]))
+            voc_est = float(v1 - i1 / slope)
+    voc_est = max(voc_est, float(v[last_pos_idx]))
 
-    # (j,k) enforce physical endpoints and ensure no post-Voc tail
-    v_clean, i_clean = enforce_physical_iv_endpoints(v_gen, i_gen, voc_est=voc_est, diag=diag, tol=1e-9)
-    if len(v_clean) < 3:
+    v_clean, i_clean = enforce_physical_iv_endpoints(v[:last_pos_idx+1], i[:last_pos_idx+1], voc_est=voc_est, diag=diag)
+    if len(v_clean) < 8:
         return np.array([]), np.array([])
-
-    # internal sanity checks (lightweight)
-    assert abs(float(v_clean[0])) <= 1e-6, "cleaned I-V must start at 0 V"
-    assert float(i_clean[0]) > 1e-9, "cleaned I-V first current must be positive for valid curves"
-    assert abs(float(i_clean[-1])) <= 1e-6, "cleaned I-V must end at 0 A at Voc"
-    assert float(v_clean[-1]) > float(v_clean[-2]), "cleaned I-V cannot have zero tail duplicates at Voc"
-    return v_clean.astype(np.float32), i_clean.astype(np.float32)
+    return v_clean.astype(np.float64), i_clean.astype(np.float64)
 
 
 def validate_cleaned_curve(v: np.ndarray, i: np.ndarray, tol: float = 1e-6) -> bool:
-    v = np.asarray(v, dtype=float).ravel()
-    i = np.asarray(i, dtype=float).ravel()
-    if len(v) != len(i):
-        return False
-    if len(v) < 8:
+    v = np.asarray(v, dtype=np.float64).ravel()
+    i = np.asarray(i, dtype=np.float64).ravel()
+    if len(v) != len(i) or len(v) < 8:
         return False
     if not np.all(np.isfinite(v)) or not np.all(np.isfinite(i)):
         return False
-    if not np.all(np.diff(v) > tol):
+    if np.any(np.diff(v) <= 0.0):
         return False
-    if abs(float(v[0])) > tol:
+    if not np.isclose(float(v[0]), 0.0, atol=tol):
         return False
-    if abs(float(i[-1])) > tol:
+    if not np.isclose(float(i[-1]), 0.0, atol=tol):
         return False
     if np.any(i < -tol):
         return False
@@ -469,28 +491,41 @@ def validate_cleaned_curve(v: np.ndarray, i: np.ndarray, tol: float = 1e-6) -> b
 
 
 def compute_mpp_dense(v: np.ndarray, i: np.ndarray, n: int = 2000) -> Tuple[float, float, np.ndarray, np.ndarray]:
-    if len(v) < 3:
+    v_res, p_res = build_pv_curve_from_iv(v, i)
+    if len(v_res) == 0:
         return 0.0, 0.0, np.array([]), np.array([])
-    v0 = float(np.min(v))
-    v1 = float(np.max(v))
-    if v1 <= v0:
-        return 0.0, 0.0, np.array([]), np.array([])
-    v_dense = np.linspace(v0, v1, n)
-    i_dense = np.interp(v_dense, v, i)
-    p_dense = v_dense * i_dense
+    v_dense, p_dense = v_res, p_res
+    if int(n) > 1 and int(n) != len(v_res):
+        v_dense = np.linspace(float(v_res[0]), float(v_res[-1]), int(n), dtype=np.float64)
+        p_dense = np.interp(v_dense, v_res, p_res)
     k = int(np.argmax(p_dense))
-    return float(v_dense[k]), float(p_dense[k]), v_dense, p_dense
+    return float(v_dense[k]), float(p_dense[k]), v_dense.astype(np.float64), p_dense.astype(np.float64)
 
 
 def prepare_pv_plot_curve(v: np.ndarray, i: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Prepare visualization-only P-V from cleaned I-V (never from raw ad hoc logic)."""
+    """Prepare visualization P-V only from cleaned, uniformly resampled I-V."""
     pv_v, pv_p = build_pv_curve_from_iv(v, i)
     if len(pv_v) < 2:
         return np.array([]), np.array([])
-    # internal sanity checks for derived P-V
-    assert abs(float(pv_p[0])) <= 1e-6, "derived P-V must start at 0 W"
-    assert abs(float(pv_p[-1])) <= 1e-6, "derived P-V must end at 0 W"
-    return pv_v, pv_p
+    assert np.isclose(float(pv_p[0]), 0.0, atol=1e-9), 'derived P-V must start at 0 W'
+    assert np.isclose(float(pv_p[-1]), 0.0, atol=1e-9), 'derived P-V must end at 0 W'
+    return pv_v.astype(np.float64), pv_p.astype(np.float64)
+
+
+def diagnose_cleaning_one_curve(curve):
+    v_raw, i_raw = extract_vi(curve)
+    print(f'raw shape: v={np.shape(v_raw)}, i={np.shape(i_raw)}')
+    v_clean, i_clean = clean_iv_curve_strict(v_raw, i_raw)
+    print(f'cleaned shape: v={v_clean.shape}, i={i_clean.shape}')
+    print(f'len match: {len(v_clean) == len(i_clean)}')
+    print(f'all finite: {np.all(np.isfinite(v_clean)) and np.all(np.isfinite(i_clean))}')
+    d = np.diff(v_clean) if len(v_clean) > 1 else np.array([])
+    print(f'min diff(v_clean): {float(np.min(d)) if len(d) else np.nan}')
+    print(f'strictly increasing v (diff > 0.0): {bool(np.all(d > 0.0)) if len(d) else False}')
+    print(f'v[0]: {float(v_clean[0]) if len(v_clean) else np.nan}')
+    print(f'i[-1]: {float(i_clean[-1]) if len(i_clean) else np.nan}')
+    print(f'max power: {float(np.max(v_clean * i_clean)) if len(v_clean) else 0.0}')
+    print(f'validate_cleaned_curve: {validate_cleaned_curve(v_clean, i_clean)}')
 
 
 def dense_peak_profile_for_plot(oracle, n_dense: int = 2000, rel_thresh: float = 0.01, min_index_gap: int = 20) -> Dict[str, Any]:
@@ -518,51 +553,6 @@ def dense_peak_profile_for_plot(oracle, n_dense: int = 2000, rel_thresh: float =
         "peak_prominence_score": float(prom_score),
         "v_dense": v_dense.astype(np.float32),
         "p_dense": p_dense.astype(np.float32),
-    }
-
-def count_local_maxima_dense(p_arr: np.ndarray, rel_thresh: float = 0.01, min_index_gap: int = 20) -> Tuple[int, List[int]]:
-    p = np.asarray(p_arr, dtype=float).ravel()
-    if len(p) < 5:
-        return 0, []
-    vmax = max(float(np.max(p)), 1e-12)
-    thresh = rel_thresh * vmax
-    peaks: List[int] = []
-    for k in range(1, len(p) - 1):
-        if p[k] >= p[k - 1] and p[k] >= p[k + 1] and p[k] >= thresh:
-            peaks.append(k)
-    if len(peaks) <= 1:
-        return len(peaks), peaks
-    merged = [peaks[0]]
-    for idx in peaks[1:]:
-        if idx - merged[-1] < min_index_gap:
-            if p[idx] > p[merged[-1]]:
-                merged[-1] = idx
-        else:
-            merged.append(idx)
-    return len(merged), merged
-
-
-def dense_peak_profile(v: np.ndarray, i: np.ndarray, cfg: Config) -> Dict[str, Any]:
-    vmpp, pmpp, v_dense, p_dense = compute_mpp_dense(v, i)
-    if len(v_dense) == 0:
-        return {"vmpp": 0.0, "pmpp": 0.0, "n_peaks": 0, "peak_idxs": [], "peak_prominence_score": 0.0,
-                "v_dense": np.array([]), "p_dense": np.array([])}
-    n_peaks, peak_idxs = count_local_maxima_dense(
-        p_dense, rel_thresh=cfg.plot_peak_rel_thresh, min_index_gap=cfg.plot_peak_min_gap
-    )
-    if n_peaks < 2:
-        prom_score = 0.0
-    else:
-        peak_vals = sorted([float(p_dense[k]) for k in peak_idxs], reverse=True)
-        prom_score = float(peak_vals[1] / max(peak_vals[0], 1e-12))
-    return {
-        "vmpp": vmpp,
-        "pmpp": pmpp,
-        "n_peaks": int(n_peaks),
-        "peak_idxs": list(peak_idxs),
-        "peak_prominence_score": prom_score,
-        "v_dense": v_dense,
-        "p_dense": p_dense,
     }
 
 # =========================================================
@@ -706,6 +696,7 @@ def build_dataset_from_curves(curves, cfg: Config):
         "left_endpoint_inserted": 0,
         "left_endpoint_repaired": 0,
         "voc_endpoint_inserted": 0,
+        "low_voltage_artifact_removed": 0,
         "rejected": 0,
     }
     for item in iter_curve_items(curves):
@@ -735,6 +726,7 @@ def build_dataset_from_curves(curves, cfg: Config):
             "left_endpoint_inserted": stats["left_endpoint_inserted"],
             "left_endpoint_repaired": stats["left_endpoint_repaired"],
             "voc_endpoint_inserted": stats["voc_endpoint_inserted"],
+            "low_voltage_artifact_removed": stats["low_voltage_artifact_removed"],
             "rejected": stats["rejected"],
         },
     )
