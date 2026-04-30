@@ -1,3 +1,16 @@
+"""Hybrid PV MPPT pipeline using sparse sampling, learning-based seeding, and local refinement.
+
+Pipeline overview
+-----------------
+1) Load PV curves from .mat/.npz sources (supports both I-V and direct P-V style encodings).
+2) Extract voltage/current-like vectors from heterogeneous MATLAB/Python container layouts.
+3) Clean curves with PV endpoint constraints (I(0)≈Isc, I(Voc)=0) and validate physical consistency.
+4) Build 12-point sparse scan features that emulate practical MPPT measurement budgets.
+5) Train/use a Physics-Informed TCNformer to predict an initial MPP voltage zone + offset.
+6) Refine the seed with local Perturb-and-Observe (P&O) to recover final tracking accuracy.
+7) Report seed-only (TCNformer) and refined (TCNformer + local P&O) metrics and visualizations.
+"""
+
 import os
 import random
 from dataclasses import dataclass
@@ -25,6 +38,8 @@ except Exception:
 
 # =========================================================
 # USER CONFIG
+# Dataset flags: path selection and run-time outputs (plots/model bundle).
+# MAT key groups map explicit simulated/shaded/normal experimental sources.
 # =========================================================
 DATASET_PATH = None
 MAKE_PLOTS = True
@@ -45,7 +60,7 @@ class Config:
         else ("mps" if torch.backends.mps.is_available() else "cpu")
     )
 
-    # 12-point scan stays exactly in the pipeline
+    # 12-point scan is intentionally preserved to emulate sparse MPPT measurement budget
     k_samples: int = 12
     sample_fracs_min: float = 0.05
     sample_fracs_max: float = 0.95
@@ -144,6 +159,23 @@ print("Dataset path:", DATASET_PATH)
 # DATA LOADING
 # =========================================================
 def iter_curve_items(curves: Any):
+    """Yield curve-like items from nested containers without assuming one storage schema.
+
+    Parameters
+    ----------
+    curves : Any
+        Container returned by dataset loaders (lists, tuples, ndarrays, MATLAB object arrays).
+
+    Returns
+    -------
+    item : Any
+        Individual candidate curve objects to be parsed by ``extract_vi``.
+
+    Notes
+    -----
+    MATLAB exports often wrap curve arrays inside object matrices; this iterator normalizes
+    traversal so downstream extraction is format-agnostic.
+    """
     if isinstance(curves, list):
         for item in curves:
             yield item
@@ -172,6 +204,7 @@ def iter_curve_items(curves: Any):
 
 
 def _maybe_struct_get(obj: Any, names: Sequence[str]) -> Any:
+    """Retrieve the first available field name from dicts or MATLAB-struct-like objects."""
     for name in names:
         if isinstance(obj, dict) and name in obj:
             return obj[name]
@@ -181,6 +214,25 @@ def _maybe_struct_get(obj: Any, names: Sequence[str]) -> Any:
 
 
 def extract_vi(curve: Any) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Extract voltage and current/power vectors from heterogeneous curve encodings.
+
+    Parameters
+    ----------
+    curve : Any
+        Curve object that may be dict-like, MATLAB struct-like, numeric matrix, or nested object array.
+
+    Returns
+    -------
+    v : Optional[np.ndarray]
+        1-D voltage vector when extraction succeeds.
+    y : Optional[np.ndarray]
+        1-D second vector (current for I-V datasets, or power for direct P-V datasets).
+
+    Notes
+    -----
+    This function intentionally accepts many storage layouts (2xN, Nx2, nested object wrappers)
+    because raw .mat exports are inconsistent across acquisition pipelines.
+    """
     if curve is None:
         return None, None
 
@@ -221,11 +273,13 @@ def extract_vi(curve: Any) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
 
 
 def _load_npz(path: str) -> Dict[str, Any]:
+    """Load an NPZ dataset into a plain key/value dictionary."""
     d = np.load(path, allow_pickle=True)
     return {k: d[k] for k in d.files}
 
 
 def _load_mat(path: str) -> Dict[str, Any]:
+    """Load a MATLAB dataset and drop private ``__`` keys."""
     if loadmat is None:
         raise RuntimeError("scipy is required to read .mat files")
     m = loadmat(path)
@@ -233,6 +287,7 @@ def _load_mat(path: str) -> Dict[str, Any]:
 
 
 def _combine_curve_groups(raw: Dict[str, Any], keys: Sequence[str]) -> List[Any]:
+    """Concatenate curves from selected MATLAB keys while tolerating missing groups."""
     rows: List[Any] = []
     for k in keys:
         if k not in raw:
@@ -242,6 +297,7 @@ def _combine_curve_groups(raw: Dict[str, Any], keys: Sequence[str]) -> List[Any]
 
 
 def load_dataset(path: str):
+    """Load simulated/shaded/normal curve groups from .npz or .mat sources."""
     if path.lower().endswith(".npz"):
         raw = _load_npz(path)
         sim_curves = list(iter_curve_items(raw["sim_curves"])) if "sim_curves" in raw else []
@@ -275,6 +331,8 @@ def load_dataset(path: str):
 # =========================================================
 # CLEANING / VALIDATION (STRICT + PHYSICALLY CONSISTENT)
 # =========================================================
+# Dense sweeps may contain almost identical voltages; merge them so downstream checks
+# enforce strictly increasing voltage without rejecting valid dense acquisitions.
 def merge_near_duplicate_voltage(v: np.ndarray, i: np.ndarray, rel_tol: float = 1e-7, abs_tol: float = 1e-6) -> Tuple[np.ndarray, np.ndarray]:
     """Merge near-duplicate voltage samples instead of rejecting dense clean curves.
 
@@ -300,10 +358,10 @@ def merge_near_duplicate_voltage(v: np.ndarray, i: np.ndarray, rel_tol: float = 
             g_i.append(float(i[k]))
         else:
             out_v.append(float(np.mean(g_v)))
-            out_i.append(float(np.median(g_i)))
+            out_i.append(float(np.median(g_i)))  # median current is robust to local outliers within repeated-voltage groups
             g_v, g_i = [float(v[k])], [float(i[k])]
     out_v.append(float(np.mean(g_v)))
-    out_i.append(float(np.median(g_i)))
+    out_i.append(float(np.median(g_i)))  # median current is robust to local outliers within repeated-voltage groups
     return np.asarray(out_v, dtype=np.float64), np.asarray(out_i, dtype=np.float64)
 
 
@@ -326,6 +384,8 @@ def estimate_isc_from_low_voltage_window(v: np.ndarray, i: np.ndarray, low_frac:
     return float(np.percentile(i[finite_pos], 85))
 
 
+# Repair endpoints to satisfy PV physics before feature extraction/training:
+# I(0)≈Isc and I(Voc)=0, which implies P(0)=P(Voc)=0 after P=V*I conversion.
 def enforce_physical_iv_endpoints(v: np.ndarray, i: np.ndarray, voc_est: Optional[float] = None, diag: Optional[Dict[str, int]] = None, tol: float = 1e-9) -> Tuple[np.ndarray, np.ndarray]:
     v = np.asarray(v, dtype=np.float64).ravel()
     i = np.asarray(i, dtype=np.float64).ravel()
@@ -387,6 +447,8 @@ def enforce_physical_iv_endpoints(v: np.ndarray, i: np.ndarray, voc_est: Optiona
     return v.astype(np.float64), np.clip(i, 0.0, None).astype(np.float64)
 
 
+# Interpolate cleaned curves onto a uniform voltage grid so MPP/peaks/plots are
+# comparable and not biased by irregular experimental sample spacing.
 def resample_iv_curve(v: np.ndarray, i: np.ndarray, n_points: int = 2000) -> Tuple[np.ndarray, np.ndarray]:
     v = np.asarray(v, dtype=np.float64).ravel()
     i = np.asarray(i, dtype=np.float64).ravel()
@@ -413,6 +475,8 @@ def build_pv_curve_from_iv(v: np.ndarray, i: np.ndarray) -> Tuple[np.ndarray, np
     return v_grid.astype(np.float64), p_grid.astype(np.float64)
 
 
+# Strict cleaner for true I-V data: sanitize, sign-correct, keep physical quadrant,
+# merge near-duplicates, estimate Voc region, and enforce physically consistent endpoints.
 def clean_iv_curve_strict(v: np.ndarray, i: np.ndarray, diag: Optional[Dict[str, int]] = None) -> Tuple[np.ndarray, np.ndarray]:
     v = np.asarray(v, dtype=np.float64).ravel()
     i = np.asarray(i, dtype=np.float64).ravel()
@@ -468,6 +532,8 @@ def clean_iv_curve_strict(v: np.ndarray, i: np.ndarray, diag: Optional[Dict[str,
     return v_clean.astype(np.float64), i_clean.astype(np.float64)
 
 
+# Validation rejects only non-positive voltage steps (not tiny positive spacing) and
+# enforces finite/nonnegative/positive-power physical plausibility checks.
 def validate_cleaned_curve(v: np.ndarray, i: np.ndarray, tol: float = 1e-6) -> bool:
     v = np.asarray(v, dtype=np.float64).ravel()
     i = np.asarray(i, dtype=np.float64).ravel()
@@ -607,6 +673,13 @@ def dense_peak_profile(v: np.ndarray, i: np.ndarray, cfg: Config) -> Dict[str, A
 # CURVE ORACLE + FEATURES
 # =========================================================
 class CurveOracle:
+    """Measurement interface over one cleaned I-V curve for controller-style voltage queries.
+
+    Notes
+    -----
+    The oracle stores cleaned data, computes Voc/Isc/true MPP, and exposes interpolation methods
+    that emulate how an MPPT controller samples the plant at chosen voltages.
+    """
     def __init__(self, curve: Any):
         v_raw, i_raw = extract_vi(curve)
         self._v, self._i = clean_iv_curve_strict(v_raw, i_raw)
@@ -656,6 +729,7 @@ def zone_index_and_offset(vhat_true: float, zone_edges: np.ndarray) -> Tuple[int
     return z, offset
 
 
+# Build sparse-observation features: the model sees 12 query points, not full dense curves.
 def build_feature_vector(v: np.ndarray, i: np.ndarray, sample_fracs: np.ndarray, cfg: Config) -> Dict[str, Any]:
     voc = float(np.max(v))
     vmpp_true, pmpp_true, _, _ = compute_mpp_dense(v, i)
@@ -784,6 +858,7 @@ def build_dataset_from_curves(curves, cfg: Config):
 # MODEL
 # =========================================================
 class CausalConvBlock(nn.Module):
+    """Causal/dilated residual block to extract local sequential patterns from sparse scans."""
     def __init__(self, channels: int, kernel_size: int, dilation: int, dropout: float):
         super().__init__()
         self.pad = (kernel_size - 1) * dilation
@@ -800,6 +875,12 @@ class CausalConvBlock(nn.Module):
 
 
 class PhysicsInformedTCNformer(nn.Module):
+    """Hybrid TCN+Transformer regressor/classifier for MPP seed prediction.
+
+    Input = flattened (seq_len=12, seq_features=4) sparse sequence + 8 global features.
+    TCN captures local voltage-axis structure, attention captures point-to-point dependencies,
+    and fusion layers output: zone probabilities, intra-zone offset, and P&O step ratio.
+    """
     def __init__(self, in_dim: int, n_zones: int, cfg: Config):
         super().__init__()
         self.cfg = cfg
@@ -839,6 +920,7 @@ class PhysicsInformedTCNformer(nn.Module):
         self.step_head = nn.Linear(cfg.latent_dim, 1)
 
     def forward(self, x: torch.Tensor):
+        # Split flattened input into sequential scan features and global/environment features.
         hist = x[:, : self.seq_len * self.seq_features]
         env = x[:, self.seq_len * self.seq_features :]
         seq = hist.view(x.shape[0], self.seq_len, self.seq_features).transpose(1, 2)  # (B, F, L)
@@ -864,6 +946,7 @@ class PhysicsInformedTCNformer(nn.Module):
 
 
 def compute_pred_vhat(zone_probs: torch.Tensor, offset: torch.Tensor, zone_edges_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Map zone probabilities + intra-zone offset into normalized voltage prediction."""
     zone_centers = 0.5 * (zone_edges_t[:-1] + zone_edges_t[1:])
     zone_widths = zone_edges_t[1:] - zone_edges_t[:-1]
     pred_center = torch.sum(zone_probs * zone_centers.unsqueeze(0), dim=1)
@@ -875,6 +958,7 @@ def compute_pred_vhat(zone_probs: torch.Tensor, offset: torch.Tensor, zone_edges
 
 
 def interp_batch_1d(v_query: torch.Tensor, v_grid: torch.Tensor, y_grid: torch.Tensor) -> torch.Tensor:
+    """Batch linear interpolation used by the physics term near predicted operating points."""
     idx_hi = torch.searchsorted(v_grid, v_query.unsqueeze(-1), right=False).squeeze(-1)
     idx_hi = torch.clamp(idx_hi, 1, v_grid.shape[1] - 1)
     idx_lo = idx_hi - 1
@@ -932,6 +1016,7 @@ def pinn_zone_offset_loss(zone_probs, offset_pred, step_ratio_pred, batch, cfg: 
 # TRAIN / PREDICT
 # =========================================================
 def rows_to_arrays(rows: List[Dict[str, Any]]) -> Dict[str, np.ndarray]:
+    """Convert feature dictionaries into aligned NumPy arrays for model training/eval."""
     seq_vhat = np.stack([r["sparse_vhat"] for r in rows], axis=0).astype(np.float32)
     seq_ihat = np.stack([r["sparse_ihat"] for r in rows], axis=0).astype(np.float32)
     out = {
@@ -983,16 +1068,19 @@ def compute_transient_convergence_steps(
 
 
 def fit_standardizer(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Fit mean/std on training features only to prevent validation leakage."""
     mu = X.mean(axis=0, keepdims=True).astype(np.float32)
     sd = (X.std(axis=0, keepdims=True) + 1e-8).astype(np.float32)
     return mu, sd
 
 
 def apply_standardizer(X: np.ndarray, mu: np.ndarray, sd: np.ndarray) -> np.ndarray:
+    """Apply precomputed training-set standardization parameters."""
     return ((X - mu) / sd).astype(np.float32)
 
 
 def train_model(sim_rows: List[Dict[str, Any]], cfg: Config):
+    """Train Physics-Informed TCNformer with holdout validation and early stopping."""
     idx = np.arange(len(sim_rows))
     idx_tr, idx_va = train_test_split(idx, test_size=cfg.sim_holdout_fraction, random_state=cfg.seed, shuffle=True)
     train_rows = [sim_rows[i] for i in idx_tr]
@@ -1363,10 +1451,18 @@ def visualize_examples_from_full_shaded_pool(examples: List[Dict[str, Any]], n_v
 
 # =========================================================
 # RUN PIPELINE
+# Execution flow:
+# 1) load dataset, 2) preprocess/clean curves, 3) print preprocessing stats,
+# 4) train TCNformer, 5) evaluate shaded set, 6) optional normal-set evaluation,
+# 7) visualize histories/examples, 8) save bundle.
 # =========================================================
 
 # =========================================================
 # RUN PIPELINE
+# Execution flow:
+# 1) load dataset, 2) preprocess/clean curves, 3) print preprocessing stats,
+# 4) train TCNformer, 5) evaluate shaded set, 6) optional normal-set evaluation,
+# 7) visualize histories/examples, 8) save bundle.
 # =========================================================
 sim_curves, exp_sh_curves, exp_ok_curves = load_dataset(DATASET_PATH)
 
