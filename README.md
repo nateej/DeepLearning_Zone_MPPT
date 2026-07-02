@@ -4,7 +4,6 @@ This repository is a notebook for exploring a hybrid maximum power point trackin
 
 The main idea is simple: instead of asking a controller to blindly chase the nearest peak, the notebook takes a small 12-point scan of the PV curve, uses a deep learning model to guess the best MPP region, and then lets a local Perturb and Observe (P&O) step refine the final operating point.
 
-I wrote this as an engineer trying to understand the behavior of the method, not as a polished black-box package. The notebook includes the data cleaning, model training, evaluation, plots, and notes that helped me reason through what the MPPT controller is doing.
 
 ## Why this project exists
 
