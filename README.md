@@ -1,6 +1,6 @@
 # DeepLearning Zone MPPT
 
-This repository is my working notebook for exploring a hybrid maximum power point tracking (MPPT) method for photovoltaic (PV) systems, especially when partial shading makes the power-voltage curve harder to track.
+This repository is a notebook for exploring a hybrid maximum power point tracking (MPPT) method for photovoltaic (PV) systems, especially when partial shading makes the power-voltage curve harder to track.
 
 The main idea is simple: instead of asking a controller to blindly chase the nearest peak, the notebook takes a small 12-point scan of the PV curve, uses a deep learning model to guess the best MPP region, and then lets a local Perturb and Observe (P&O) step refine the final operating point.
 
